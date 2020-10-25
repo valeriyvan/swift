@@ -20,8 +20,9 @@
 #include "swift/AST/ASTDemangler.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/LookupKinds.h"
+#include "swift/AST/ModuleNameLookup.h"
 #include "swift/AST/NameLookup.h"
-#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/SwiftNameTranslation.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/Basic/SourceManager.h"
@@ -415,14 +416,13 @@ static void printAnnotatedDeclaration(const ValueDecl *VD,
   while (VD->isImplicit() && VD->getOverriddenDecl())
     VD = VD->getOverriddenDecl();
 
-  // If this is a property wrapper backing property (_foo) or projected value
-  // ($foo) and the wrapped property is not implicit, still print it.
-  if (auto *VarD = dyn_cast<VarDecl>(VD)) {
-    if (auto *Wrapped = VarD->getOriginalWrappedProperty()) {
-      if (!Wrapped->isImplicit())
-        PO.TreatAsExplicitDeclList.push_back(VD);
-    }
-  }
+  // VD may be a compiler synthesized member, constructor, or shorthand argument
+  // so always print it even if it's implicit.
+  //
+  // FIXME: Update PrintOptions::printQuickHelpDeclaration to print implicit
+  // decls by default. That causes issues due to newlines being printed before
+  // implicit OpaqueTypeDecls at time of writing.
+  PO.TreatAsExplicitDeclList.push_back(VD);
 
   // Wrap this up in XML, as that's what we'll use for documentation comments.
   OS<<"<Declaration>";
@@ -446,14 +446,14 @@ void SwiftLangSupport::printFullyAnnotatedDeclaration(const ValueDecl *VD,
   while (VD->isImplicit() && VD->getOverriddenDecl())
     VD = VD->getOverriddenDecl();
 
-  // If this is a property wrapper backing property (_foo) or projected value
-  // ($foo) and the wrapped property is not implicit, still print it.
-  if (auto *VarD = dyn_cast<VarDecl>(VD)) {
-    if (auto *Wrapped = VarD->getOriginalWrappedProperty()) {
-      if (!Wrapped->isImplicit())
-        PO.TreatAsExplicitDeclList.push_back(VD);
-    }
-  }
+  // VD may be a compiler synthesized member, constructor, or shorthand argument
+  // so always print it even if it's implicit.
+  //
+  // FIXME: Update PrintOptions::printQuickHelpDeclaration to print implicit
+  // decls by default. That causes issues due to newlines being printed before
+  // implicit OpaqueTypeDecls at time of writing.
+  PO.TreatAsExplicitDeclList.push_back(VD);
+
   VD->print(Printer, PO);
 }
 
@@ -485,40 +485,49 @@ void SwiftLangSupport::printFullyAnnotatedSynthesizedDeclaration(
 
 template <typename FnTy>
 void walkRelatedDecls(const ValueDecl *VD, const FnTy &Fn) {
-  llvm::SmallDenseMap<DeclName, unsigned, 16> NamesSeen;
-  ++NamesSeen[VD->getName()];
-  SmallVector<LookupResultEntry, 8> RelatedDecls;
-
   if (isa<ParamDecl>(VD))
     return; // Parameters don't have interesting related declarations.
 
-  // FIXME: Extract useful related declarations, overloaded functions,
-  // if VD is an initializer, we should extract other initializers etc.
-  // For now we use unqualified lookup to fetch other declarations with the same
-  // base name.
   auto &ctx = VD->getASTContext();
-  auto descriptor = UnqualifiedLookupDescriptor(DeclNameRef(VD->getBaseName()),
-                                                VD->getDeclContext());
-  auto lookup = evaluateOrDefault(ctx.evaluator,
-                                  UnqualifiedLookupRequest{descriptor}, {});
-  for (auto result : lookup) {
-    ValueDecl *RelatedVD = result.getValueDecl();
-    if (RelatedVD->getAttrs().isUnavailable(VD->getASTContext()))
+
+  llvm::SmallDenseMap<DeclName, unsigned, 16> NamesSeen;
+  ++NamesSeen[VD->getName()];
+
+
+  auto *DC = VD->getDeclContext();
+  bool typeLookup = DC->isTypeContext();
+
+  SmallVector<ValueDecl *, 4> results;
+
+  if (typeLookup) {
+    auto type = DC->getDeclaredInterfaceType();
+    if (!type->is<ErrorType>()) {
+      DC->lookupQualified(type, DeclNameRef(VD->getBaseName()),
+                          NL_QualifiedDefault, results);
+    }
+  } else {
+    namelookup::lookupInModule(DC->getModuleScopeContext(),
+                               VD->getBaseName(), results,
+                               NLKind::UnqualifiedLookup,
+                               namelookup::ResolutionKind::Overloadable,
+                               DC->getModuleScopeContext(),
+                               NL_UnqualifiedDefault);
+  }
+
+  SmallVector<ValueDecl *, 8> RelatedDecls;
+  for (auto result : results) {
+    if (result->getAttrs().isUnavailable(ctx))
       continue;
 
-    if (RelatedVD != VD) {
-      ++NamesSeen[RelatedVD->getName()];
+    if (result != VD) {
+      ++NamesSeen[result->getName()];
       RelatedDecls.push_back(result);
     }
   }
 
   // Now provide the results along with whether the name is duplicate or not.
-  ValueDecl *OriginalBase = VD->getDeclContext()->getSelfNominalTypeDecl();
-  for (auto Related : RelatedDecls) {
-    ValueDecl *RelatedVD = Related.getValueDecl();
-    bool SameBase = Related.getBaseDecl() && Related.getBaseDecl() == OriginalBase;
-    Fn(RelatedVD, SameBase, NamesSeen[RelatedVD->getName()] > 1);
-  }
+  for (auto result : RelatedDecls)
+    Fn(result, typeLookup, NamesSeen[result->getName()] > 1);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1208,8 +1217,8 @@ public:
     ImmutableTextSnapshotRef InputSnap;
     if (auto EditorDoc = Lang.getEditorDocuments()->findByPath(InputFile))
       InputSnap = EditorDoc->getLatestSnapshot();
-      if (!InputSnap)
-        return false;
+    if (!InputSnap)
+      return false;
 
     auto mappedBackOffset = [&]()->llvm::Optional<unsigned> {
       for (auto &Snap : Snapshots) {

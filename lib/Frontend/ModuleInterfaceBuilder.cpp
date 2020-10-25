@@ -147,11 +147,13 @@ bool ModuleInterfaceBuilder::collectDepsForSerialization(
 
 bool ModuleInterfaceBuilder::buildSwiftModuleInternal(
     StringRef OutPath, bool ShouldSerializeDeps,
-    std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer) {
+    std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
+    ArrayRef<std::string> CompiledCandidates) {
 
   auto outerPrettyStackState = llvm::SavePrettyStackState();
 
   bool SubError = false;
+  static const size_t ThreadStackSize = 8 << 20; // 8 MB.
   bool RunSuccess = llvm::CrashRecoveryContext().RunSafelyOnThread([&] {
     // Pretend we're on the original thread for pretty-stack-trace purposes.
     auto savedInnerPrettyStackState = llvm::SavePrettyStackState();
@@ -160,16 +162,24 @@ bool ModuleInterfaceBuilder::buildSwiftModuleInternal(
       llvm::RestorePrettyStackState(savedInnerPrettyStackState);
     };
 
-    SubError = subASTDelegate.runInSubCompilerInstance(moduleName,
-                                                       interfacePath,
-                                                       OutPath,
-                                                       diagnosticLoc,
+    SubError = (bool)subASTDelegate.runInSubCompilerInstance(moduleName,
+                                                             interfacePath,
+                                                             OutPath,
+                                                             diagnosticLoc,
                                            [&](SubCompilerInstanceInfo &info) {
     auto &SubInstance = *info.Instance;
     auto subInvocation = SubInstance.getInvocation();
+    // Try building forwarding module first. If succeed, return.
+    if (SubInstance.getASTContext().getModuleInterfaceChecker()
+          ->tryEmitForwardingModule(moduleName, interfacePath,
+                                    CompiledCandidates, OutPath)) {
+      return std::error_code();
+    }
     FrontendOptions &FEOpts = subInvocation.getFrontendOptions();
+    bool isTypeChecking =
+        (FEOpts.RequestedAction == FrontendOptions::ActionType::Typecheck);
     const auto &InputInfo = FEOpts.InputsAndOutputs.firstInput();
-    StringRef InPath = InputInfo.file();
+    StringRef InPath = InputInfo.getFileName();
     const auto &OutputInfo =
     InputInfo.getPrimarySpecificPaths().SupplementaryOutputs;
     StringRef OutPath = OutputInfo.ModuleOutputPath;
@@ -190,9 +200,9 @@ bool ModuleInterfaceBuilder::buildSwiftModuleInternal(
             getSwiftInterfaceCompilerVersionForCurrentCompiler(
                 SubInstance.getASTContext());
         StringRef emittedByCompiler = info.CompilerVersion;
-        diagnose(diag::module_interface_build_failed, moduleName,
-                 emittedByCompiler == builtByCompiler, emittedByCompiler,
-                 builtByCompiler);
+        diagnose(diag::module_interface_build_failed, isTypeChecking,
+                 moduleName, emittedByCompiler == builtByCompiler,
+                 emittedByCompiler, builtByCompiler);
       }
     };
 
@@ -200,7 +210,7 @@ bool ModuleInterfaceBuilder::buildSwiftModuleInternal(
     SubInstance.performSema();
     if (SubInstance.getASTContext().hadError()) {
       LLVM_DEBUG(llvm::dbgs() << "encountered errors\n");
-      return true;
+      return std::make_error_code(std::errc::not_supported);
     }
 
     SILOptions &SILOpts = subInvocation.getSILOptions();
@@ -209,7 +219,7 @@ bool ModuleInterfaceBuilder::buildSwiftModuleInternal(
     auto SILMod = performASTLowering(Mod, TC, SILOpts);
     if (!SILMod) {
       LLVM_DEBUG(llvm::dbgs() << "SILGen did not produce a module\n");
-      return true;
+      return std::make_error_code(std::errc::not_supported);
     }
 
     // Setup the callbacks for serialization, which can occur during the
@@ -229,11 +239,14 @@ bool ModuleInterfaceBuilder::buildSwiftModuleInternal(
     SmallVector<FileDependency, 16> Deps;
     bool serializeHashes = FEOpts.SerializeModuleInterfaceDependencyHashes;
     if (collectDepsForSerialization(SubInstance, Deps, serializeHashes)) {
-      return true;
+      return std::make_error_code(std::errc::not_supported);
     }
     if (ShouldSerializeDeps)
       SerializationOpts.Dependencies = Deps;
     SILMod->setSerializeSILAction([&]() {
+      if (isTypeChecking)
+        return;
+
       // We don't want to serialize module docs in the cache -- they
       // will be serialized beside the interface file.
       serializeToBuffers(Mod, SerializationOpts, ModuleBuffer,
@@ -245,23 +258,28 @@ bool ModuleInterfaceBuilder::buildSwiftModuleInternal(
     LLVM_DEBUG(llvm::dbgs() << "Running SIL processing passes\n");
     if (SubInstance.performSILProcessing(SILMod.get())) {
       LLVM_DEBUG(llvm::dbgs() << "encountered errors\n");
-      return true;
+      return std::make_error_code(std::errc::not_supported);
     }
-    return SubInstance.getDiags().hadAnyError();
+    if (SubInstance.getDiags().hadAnyError()) {
+      return std::make_error_code(std::errc::not_supported);
+    }
+    return std::error_code();
     });
-  });
+  }, ThreadStackSize);
   return !RunSuccess || SubError;
 }
 
 bool ModuleInterfaceBuilder::buildSwiftModule(StringRef OutPath,
                                               bool ShouldSerializeDeps,
                           std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
-                          llvm::function_ref<void()> RemarkRebuild) {
+                          llvm::function_ref<void()> RemarkRebuild,
+                          ArrayRef<std::string> CompiledCandidates) {
   auto build = [&]() {
     if (RemarkRebuild) {
       RemarkRebuild();
     }
-    return buildSwiftModuleInternal(OutPath, ShouldSerializeDeps, ModuleBuffer);
+    return buildSwiftModuleInternal(OutPath, ShouldSerializeDeps, ModuleBuffer,
+                                    CompiledCandidates);
   };
   if (disableInterfaceFileLock) {
     return build();
@@ -279,7 +297,7 @@ bool ModuleInterfaceBuilder::buildSwiftModule(StringRef OutPath,
     // necessary for performance. Fallback to building the module in case of any lock
     // related errors.
     if (RemarkRebuild) {
-      diagnose(diag::interface_file_lock_failure, interfacePath);
+      diagnose(diag::interface_file_lock_failure);
     }
     // Clear out any potential leftover.
     Locked.unsafeRemoveLockFile();

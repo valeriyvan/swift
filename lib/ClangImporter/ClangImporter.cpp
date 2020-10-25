@@ -21,8 +21,9 @@
 #include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsClangImporter.h"
-#include "swift/AST/ImportCache.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/AST/ImportCache.h"
 #include "swift/AST/LinkLibrary.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
@@ -32,14 +33,12 @@
 #include "swift/Basic/Range.h"
 #include "swift/Basic/StringExtras.h"
 #include "swift/Basic/Version.h"
-#include "swift/ClangImporter/ClangImporterOptions.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Config.h"
 #include "swift/Demangling/Demangle.h"
-#include "swift/ClangImporter/ClangModule.h"
-#include "swift/Config.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/Parser.h"
+#include "swift/Strings.h"
 #include "swift/Subsystems.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Mangle.h"
@@ -328,12 +327,13 @@ class ClangImporterDependencyCollector : public clang::DependencyCollector
   /// The FileCollector is used by LLDB to generate reproducers. It's not used
   /// by Swift to track dependencies.
   std::shared_ptr<llvm::FileCollector> FileCollector;
-  const bool TrackSystemDeps;
+  const IntermoduleDepTrackingMode Mode;
 
 public:
   ClangImporterDependencyCollector(
-      bool TrackSystemDeps, std::shared_ptr<llvm::FileCollector> FileCollector)
-      : FileCollector(FileCollector), TrackSystemDeps(TrackSystemDeps) {}
+      IntermoduleDepTrackingMode Mode,
+      std::shared_ptr<llvm::FileCollector> FileCollector)
+      : FileCollector(FileCollector), Mode(Mode) {}
 
   void excludePath(StringRef filename) {
     ExcludedPaths.insert(filename);
@@ -345,7 +345,9 @@ public:
             || Filename == ImporterImpl::bridgingHeaderBufferName);
   }
 
-  bool needSystemDependencies() override { return TrackSystemDeps; }
+  bool needSystemDependencies() override {
+    return Mode == IntermoduleDepTrackingMode::IncludeSystem;
+  }
 
   bool sawDependency(StringRef Filename, bool FromClangModule,
                      bool IsSystem, bool IsClangModuleFile,
@@ -375,8 +377,9 @@ public:
 
 std::shared_ptr<clang::DependencyCollector>
 ClangImporter::createDependencyCollector(
-    bool TrackSystemDeps, std::shared_ptr<llvm::FileCollector> FileCollector) {
-  return std::make_shared<ClangImporterDependencyCollector>(TrackSystemDeps,
+    IntermoduleDepTrackingMode Mode,
+    std::shared_ptr<llvm::FileCollector> FileCollector) {
+  return std::make_shared<ClangImporterDependencyCollector>(Mode,
                                                             FileCollector);
 }
 
@@ -405,11 +408,10 @@ bool ClangImporter::Implementation::shouldIgnoreBridgeHeaderTopLevelDecl(
 }
 
 ClangImporter::ClangImporter(ASTContext &ctx,
-                             const ClangImporterOptions &clangImporterOpts,
                              DependencyTracker *tracker,
                              DWARFImporterDelegate *dwarfImporterDelegate)
     : ClangModuleLoader(tracker),
-      Impl(*new Implementation(ctx, clangImporterOpts, dwarfImporterDelegate)) {
+      Impl(*new Implementation(ctx, dwarfImporterDelegate)) {
 }
 
 ClangImporter::~ClangImporter() {
@@ -461,12 +463,11 @@ getGlibcModuleMapPath(SearchPathOptions& Opts, llvm::Triple triple,
 void
 importer::getNormalInvocationArguments(
     std::vector<std::string> &invocationArgStrs,
-    ASTContext &ctx,
-    const ClangImporterOptions &importerOpts) {
+    ASTContext &ctx) {
   const auto &LangOpts = ctx.LangOpts;
   const llvm::Triple &triple = LangOpts.Target;
   SearchPathOptions &searchPathOpts = ctx.SearchPathOpts;
-
+  ClangImporterOptions &importerOpts = ctx.ClangImporterOpts;
   auto languageVersion = ctx.LangOpts.EffectiveLanguageVersion;
 
   if (llvm::sys::path::extension(importerOpts.BridgingHeader)
@@ -683,8 +684,7 @@ importer::getNormalInvocationArguments(
 
 static void
 getEmbedBitcodeInvocationArguments(std::vector<std::string> &invocationArgStrs,
-                                   ASTContext &ctx,
-                                   const ClangImporterOptions &importerOpts) {
+                                   ASTContext &ctx) {
   invocationArgStrs.insert(invocationArgStrs.end(), {
     // Backend mode.
     "-fembed-bitcode",
@@ -699,11 +699,11 @@ getEmbedBitcodeInvocationArguments(std::vector<std::string> &invocationArgStrs,
 void
 importer::addCommonInvocationArguments(
     std::vector<std::string> &invocationArgStrs,
-    ASTContext &ctx,
-    const ClangImporterOptions &importerOpts) {
+    ASTContext &ctx) {
   using ImporterImpl = ClangImporter::Implementation;
   const llvm::Triple &triple = ctx.LangOpts.Target;
   SearchPathOptions &searchPathOpts = ctx.SearchPathOpts;
+  const ClangImporterOptions &importerOpts = ctx.ClangImporterOpts;
 
   invocationArgStrs.push_back("-target");
   invocationArgStrs.push_back(triple.str());
@@ -724,14 +724,23 @@ importer::addCommonInvocationArguments(
     invocationArgStrs.push_back("-mcpu=" + importerOpts.TargetCPU);
 
   } else if (triple.isOSDarwin()) {
-    // Special case: arm64 defaults to the "cyclone" CPU for Darwin,
-    // and arm64e defaults to the "vortex" CPU for Darwin,
-    // but Clang only detects this if we use -arch.
+    // Special case CPU based on known deployments:
+    //   - arm64 deploys to apple-a7
+    //   - arm64 on macOS
+    //   - arm64 for iOS/tvOS/watchOS simulators
+    //   - arm64e deploys to apple-a12
+    // and arm64e (everywhere) and arm64e macOS defaults to the "apple-a12" CPU
+    // for Darwin, but Clang only detects this if we use -arch.
     if (triple.getArchName() == "arm64e")
-      invocationArgStrs.push_back("-mcpu=vortex");
+      invocationArgStrs.push_back("-mcpu=apple-a12");
+    else if (triple.isAArch64() && triple.isMacOSX())
+      invocationArgStrs.push_back("-mcpu=apple-a12");
+    else if (triple.isAArch64() && triple.isSimulatorEnvironment() &&
+             (triple.isiOS() || triple.isWatchOS()))
+      invocationArgStrs.push_back("-mcpu=apple-a12");
     else if (triple.getArch() == llvm::Triple::aarch64 ||
              triple.getArch() == llvm::Triple::aarch64_be) {
-      invocationArgStrs.push_back("-mcpu=cyclone");
+      invocationArgStrs.push_back("-mcpu=apple-a7");
     }
   } else if (triple.getArch() == llvm::Triple::systemz) {
     invocationArgStrs.push_back("-march=z13");
@@ -906,25 +915,24 @@ ClangImporter::getOrCreatePCH(const ClangImporterOptions &ImporterOptions,
 }
 
 std::vector<std::string>
-ClangImporter::getClangArguments(ASTContext &ctx,
-                                 const ClangImporterOptions &importerOpts) {
-  if (importerOpts.ExtraArgsOnly) {
-    return importerOpts.ExtraArgs;
+ClangImporter::getClangArguments(ASTContext &ctx) {
+  if (ctx.ClangImporterOpts.ExtraArgsOnly) {
+    return ctx.ClangImporterOpts.ExtraArgs;
   }
   std::vector<std::string> invocationArgStrs;
   // Clang expects this to be like an actual command line. So we need to pass in
   // "clang" for argv[0]
   invocationArgStrs.push_back("clang");
-  switch (importerOpts.Mode) {
+  switch (ctx.ClangImporterOpts.Mode) {
   case ClangImporterOptions::Modes::Normal:
   case ClangImporterOptions::Modes::PrecompiledModule:
-    getNormalInvocationArguments(invocationArgStrs, ctx, importerOpts);
+    getNormalInvocationArguments(invocationArgStrs, ctx);
     break;
   case ClangImporterOptions::Modes::EmbedBitcode:
-    getEmbedBitcodeInvocationArguments(invocationArgStrs, ctx, importerOpts);
+    getEmbedBitcodeInvocationArguments(invocationArgStrs, ctx);
     break;
   }
-  addCommonInvocationArguments(invocationArgStrs, ctx, importerOpts);
+  addCommonInvocationArguments(invocationArgStrs, ctx);
   return invocationArgStrs;
 }
 
@@ -960,19 +968,15 @@ ClangImporter::createClangInvocation(ClangImporter *importer,
                                                 nullptr, false, CC1Args);
 }
 
-ArrayRef<std::string> ClangImporter::getExtraClangArgs() const {
-  return Impl.ExtraClangArgs;
-}
-
 std::unique_ptr<ClangImporter>
-ClangImporter::create(ASTContext &ctx, const ClangImporterOptions &importerOpts,
+ClangImporter::create(ASTContext &ctx,
                       std::string swiftPCHHash, DependencyTracker *tracker,
                       DWARFImporterDelegate *dwarfImporterDelegate) {
   std::unique_ptr<ClangImporter> importer{
-      new ClangImporter(ctx, importerOpts, tracker, dwarfImporterDelegate)};
-  importer->Impl.ClangArgs = getClangArguments(ctx, importerOpts);
+      new ClangImporter(ctx, tracker, dwarfImporterDelegate)};
+  auto &importerOpts = ctx.ClangImporterOpts;
+  importer->Impl.ClangArgs = getClangArguments(ctx);
   ArrayRef<std::string> invocationArgStrs = importer->Impl.ClangArgs;
-  importer->Impl.ExtraClangArgs = importerOpts.ExtraArgs;
   if (importerOpts.DumpClangDiagnostics) {
     llvm::errs() << "'";
     llvm::interleave(
@@ -1183,7 +1187,8 @@ ClangImporter::create(ASTContext &ctx, const ClangImporterOptions &importerOpts,
     = clangContext.Selectors.getSelector(2, setObjectForKeyedSubscriptIdents);
 
   // Set up the imported header module.
-  auto *importedHeaderModule = ModuleDecl::create(ctx.getIdentifier("__ObjC"), ctx);
+  auto *importedHeaderModule =
+      ModuleDecl::create(ctx.getIdentifier(CLANG_HEADER_MODULE_NAME), ctx);
   importer->Impl.ImportedHeaderUnit =
     new (ctx) ClangModuleUnit(*importedHeaderModule, importer->Impl, nullptr);
   importedHeaderModule->addFile(*importer->Impl.ImportedHeaderUnit);
@@ -1582,6 +1587,30 @@ ClangImporter::emitBridgingPCH(StringRef headerPath,
   return false;
 }
 
+bool ClangImporter::runPreprocessor(StringRef inputPath, StringRef outputPath) {
+  auto emitInstance = cloneCompilerInstanceForPrecompiling();
+  auto &invocation = emitInstance->getInvocation();
+  auto LangOpts = invocation.getLangOpts();
+  auto &OutputOpts = invocation.getPreprocessorOutputOpts();
+  OutputOpts.ShowCPP = 1;
+  OutputOpts.ShowComments = 0;
+  OutputOpts.ShowLineMarkers = 0;
+  OutputOpts.ShowMacros = 0;
+  OutputOpts.ShowMacroComments = 0;
+  auto language = getLanguageFromOptions(LangOpts);
+  auto inputFile = clang::FrontendInputFile(inputPath, language);
+
+  auto &FrontendOpts = invocation.getFrontendOpts();
+  FrontendOpts.Inputs = {inputFile};
+  FrontendOpts.OutputFile = outputPath.str();
+  FrontendOpts.ProgramAction = clang::frontend::PrintPreprocessedInput;
+
+  auto action = wrapActionForIndexingIfEnabled(
+      FrontendOpts, std::make_unique<clang::PrintPreprocessedAction>());
+  emitInstance->ExecuteAction(*action);
+  return emitInstance->getDiagnostics().hasErrorOccurred();
+}
+
 bool ClangImporter::emitPrecompiledModule(StringRef moduleMapPath,
                                           StringRef moduleName,
                                           StringRef outputPath) {
@@ -1594,11 +1623,12 @@ bool ClangImporter::emitPrecompiledModule(StringRef moduleMapPath,
   LangOpts->CurrentModule = LangOpts->ModuleName;
 
   auto language = getLanguageFromOptions(LangOpts);
-  auto inputFile = clang::FrontendInputFile(
-      moduleMapPath, clang::InputKind(
-          language, clang::InputKind::ModuleMap, false));
 
   auto &FrontendOpts = invocation.getFrontendOpts();
+  auto inputFile = clang::FrontendInputFile(
+      moduleMapPath, clang::InputKind(
+          language, clang::InputKind::ModuleMap, false),
+      FrontendOpts.IsSystemModule);
   FrontendOpts.Inputs = {inputFile};
   FrontendOpts.OriginalModuleMap = moduleMapPath.str();
   FrontendOpts.OutputFile = outputPath.str();
@@ -1655,7 +1685,7 @@ void ClangImporter::collectVisibleTopLevelModuleNames(
 }
 
 void ClangImporter::collectSubModuleNames(
-    ArrayRef<Located<Identifier>> path,
+    ImportPath::Module path,
     std::vector<std::string> &names) const {
   auto &clangHeaderSearch = Impl.getClangPreprocessor().getHeaderSearchInfo();
 
@@ -1666,7 +1696,7 @@ void ClangImporter::collectSubModuleNames(
   if (!clangModule)
     return;
   clang::Module *submodule = clangModule;
-  for (auto component : path.slice(1)) {
+  for (auto component : path.getSubmodulePath()) {
     submodule = submodule->findSubmodule(component.Item.str());
     if (!submodule)
       return;
@@ -1679,7 +1709,7 @@ bool ClangImporter::isModuleImported(const clang::Module *M) {
   return M->NameVisibility == clang::Module::NameVisibilityKind::AllVisible;
 }
 
-bool ClangImporter::canImportModule(Located<Identifier> moduleID) {
+bool ClangImporter::canImportModule(ImportPath::Element moduleID) {
   // Look up the top-level module to see if it exists.
   // FIXME: This only works with top-level modules.
   auto &clangHeaderSearch = Impl.getClangPreprocessor().getHeaderSearchInfo();
@@ -1698,8 +1728,7 @@ bool ClangImporter::canImportModule(Located<Identifier> moduleID) {
 }
 
 ModuleDecl *ClangImporter::Implementation::loadModuleClang(
-    SourceLoc importLoc, ArrayRef<Located<Identifier>> path) {
-  auto &clangContext = getClangASTContext();
+    SourceLoc importLoc, ImportPath::Module path) {
   auto &clangHeaderSearch = getClangPreprocessor().getHeaderSearchInfo();
 
   // Look up the top-level module first, to see if it exists at all.
@@ -1713,18 +1742,17 @@ ModuleDecl *ClangImporter::Implementation::loadModuleClang(
   SmallVector<std::pair<clang::IdentifierInfo *, clang::SourceLocation>, 4>
       clangPath;
   for (auto component : path) {
-    clangPath.push_back({&clangContext.Idents.get(component.Item.str()),
-                         exportSourceLoc(component.Loc)});
+    clangPath.emplace_back(
+        getClangPreprocessor().getIdentifierInfo(component.Item.str()),
+        exportSourceLoc(component.Loc));
   }
 
   auto &rawDiagClient = Instance->getDiagnosticClient();
   auto &diagClient = static_cast<ClangDiagnosticConsumer &>(rawDiagClient);
 
   auto loadModule = [&](clang::ModuleIdPath path,
-                        bool makeVisible) -> clang::ModuleLoadResult {
-    clang::Module::NameVisibilityKind visibility =
-        makeVisible ? clang::Module::AllVisible : clang::Module::Hidden;
-
+                        clang::Module::NameVisibilityKind visibility)
+      -> clang::ModuleLoadResult {
     auto importRAII =
         diagClient.handleImport(clangPath.front().first, importLoc);
 
@@ -1750,20 +1778,27 @@ ModuleDecl *ClangImporter::Implementation::loadModuleClang(
       clangFEOpts.IndexStorePath = preservedIndexStorePathOption;
     }
 
-    if (result && makeVisible)
+    if (result && (visibility == clang::Module::AllVisible)) {
       getClangPreprocessor().makeModuleVisible(result, clangImportLoc);
+    }
     return result;
   };
 
   // Now load the top-level module, so that we can check if the submodule
   // exists without triggering a fatal error.
-  clangModule = loadModule(clangPath.front(), false);
+  clangModule = loadModule(clangPath.front(), clang::Module::AllVisible);
   if (!clangModule)
     return nullptr;
 
+  // If we're asked to import the top-level module then we're done here.
+  auto *topSwiftModule = finishLoadingClangModule(clangModule, importLoc);
+  if (path.size() == 1) {
+    return topSwiftModule;
+  }
+
   // Verify that the submodule exists.
   clang::Module *submodule = clangModule;
-  for (auto &component : path.slice(1)) {
+  for (auto &component : path.getSubmodulePath()) {
     submodule = submodule->findSubmodule(component.Item.str());
 
     // Special case: a submodule named "Foo.Private" can be moved to a top-level
@@ -1771,8 +1806,9 @@ ModuleDecl *ClangImporter::Implementation::loadModuleClang(
     // We're limiting this to just submodules named "Private" because this will
     // put the Clang AST in a fatal error state if it /doesn't/ exist.
     if (!submodule && component.Item.str() == "Private" &&
-        (&component) == (&path[1])) {
-      submodule = loadModule(llvm::makeArrayRef(clangPath).slice(0, 2), false);
+        (&component) == (&path.getRaw()[1])) {
+      submodule = loadModule(llvm::makeArrayRef(clangPath).slice(0, 2),
+                             clang::Module::Hidden);
     }
 
     if (!submodule) {
@@ -1782,7 +1818,7 @@ ModuleDecl *ClangImporter::Implementation::loadModuleClang(
   }
 
   // Finally, load the submodule and make it visible.
-  clangModule = loadModule(clangPath, true);
+  clangModule = loadModule(clangPath, clang::Module::AllVisible);
   if (!clangModule)
     return nullptr;
 
@@ -1791,12 +1827,12 @@ ModuleDecl *ClangImporter::Implementation::loadModuleClang(
 
 ModuleDecl *
 ClangImporter::loadModule(SourceLoc importLoc,
-                          ArrayRef<Located<Identifier>> path) {
+                          ImportPath::Module path) {
   return Impl.loadModule(importLoc, path);
 }
 
 ModuleDecl *ClangImporter::Implementation::loadModule(
-    SourceLoc importLoc, ArrayRef<Located<Identifier>> path) {
+    SourceLoc importLoc, ImportPath::Module path) {
   ModuleDecl *MD = nullptr;
   if (!DisableSourceImport)
     MD = loadModuleClang(importLoc, path);
@@ -1888,10 +1924,14 @@ PlatformAvailability::PlatformAvailability(const LangOptions &langOpts)
     deprecatedAsUnavailableMessage = "";
     break;
 
-  case PlatformKind::OSX:
-  case PlatformKind::OSXApplicationExtension:
+  case PlatformKind::macOS:
+  case PlatformKind::macOSApplicationExtension:
     deprecatedAsUnavailableMessage =
         "APIs deprecated as of macOS 10.9 and earlier are unavailable in Swift";
+    break;
+
+  case PlatformKind::OpenBSD:
+    deprecatedAsUnavailableMessage = "";
     break;
 
   case PlatformKind::none:
@@ -1901,9 +1941,9 @@ PlatformAvailability::PlatformAvailability(const LangOptions &langOpts)
 
 bool PlatformAvailability::isPlatformRelevant(StringRef name) const {
   switch (platformKind) {
-  case PlatformKind::OSX:
+  case PlatformKind::macOS:
     return name == "macos";
-  case PlatformKind::OSXApplicationExtension:
+  case PlatformKind::macOSApplicationExtension:
     return name == "macos" || name == "macos_app_extension";
 
   case PlatformKind::iOS:
@@ -1926,6 +1966,9 @@ bool PlatformAvailability::isPlatformRelevant(StringRef name) const {
   case PlatformKind::watchOSApplicationExtension:
     return name == "watchos" || name == "watchos_app_extension";
 
+  case PlatformKind::OpenBSD:
+    return name == "openbsd";
+
   case PlatformKind::none:
     return false;
   }
@@ -1943,8 +1986,8 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
   case PlatformKind::none:
     llvm_unreachable("version but no platform?");
 
-  case PlatformKind::OSX:
-  case PlatformKind::OSXApplicationExtension:
+  case PlatformKind::macOS:
+  case PlatformKind::macOSApplicationExtension:
     // Anything deprecated in OSX 10.9.x and earlier is unavailable in Swift.
     return major < 10 ||
            (major == 10 && (!minor.hasValue() || minor.getValue() <= 9));
@@ -1965,26 +2008,30 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
   case PlatformKind::watchOSApplicationExtension:
     // No deprecation filter on watchOS
     return false;
+
+  case PlatformKind::OpenBSD:
+    // No deprecation filter on OpenBSD
+    return false;
   }
 
   llvm_unreachable("Unexpected platform");
 }
 
 ClangImporter::Implementation::Implementation(
-    ASTContext &ctx, const ClangImporterOptions &opts,
+    ASTContext &ctx,
     DWARFImporterDelegate *dwarfImporterDelegate)
     : SwiftContext(ctx),
-      ImportForwardDeclarations(opts.ImportForwardDeclarations),
-      InferImportAsMember(opts.InferImportAsMember),
-      DisableSwiftBridgeAttr(opts.DisableSwiftBridgeAttr),
-      BridgingHeaderExplicitlyRequested(!opts.BridgingHeader.empty()),
-      DisableOverlayModules(opts.DisableOverlayModules),
+      ImportForwardDeclarations(ctx.ClangImporterOpts.ImportForwardDeclarations),
+      InferImportAsMember(ctx.ClangImporterOpts.InferImportAsMember),
+      DisableSwiftBridgeAttr(ctx.ClangImporterOpts.DisableSwiftBridgeAttr),
+      BridgingHeaderExplicitlyRequested(!ctx.ClangImporterOpts.BridgingHeader.empty()),
+      DisableOverlayModules(ctx.ClangImporterOpts.DisableOverlayModules),
       IsReadingBridgingPCH(false),
       CurrentVersion(ImportNameVersion::fromOptions(ctx.LangOpts)),
       BridgingHeaderLookupTable(new SwiftLookupTable(nullptr)),
       BuffersForDiagnostics(ctx.SourceMgr),
       platformAvailability(ctx.LangOpts), nameImporter(),
-      DisableSourceImport(opts.DisableSourceImport),
+      DisableSourceImport(ctx.ClangImporterOpts.DisableSourceImport),
       DWARFImporter(dwarfImporterDelegate) {}
 
 ClangImporter::Implementation::~Implementation() {
@@ -2696,7 +2743,7 @@ void ClangImporter::lookupRelatedEntity(
   }
 }
 
-void ClangModuleUnit::lookupVisibleDecls(ModuleDecl::AccessPathTy accessPath,
+void ClangModuleUnit::lookupVisibleDecls(ImportPath::Access accessPath,
                                          VisibleDeclConsumer &consumer,
                                          NLKind lookupKind) const {
   // FIXME: Ignore submodules, which are empty for now.
@@ -2817,13 +2864,14 @@ ImportDecl *swift::createImportDecl(ASTContext &Ctx,
                                     ArrayRef<clang::Module *> Exported) {
   auto *ImportedMod = ClangN.getClangModule();
   assert(ImportedMod);
-  SmallVector<Located<Identifier>, 4> AccessPath;
+
+  ImportPath::Builder importPath;
   auto *TmpMod = ImportedMod;
   while (TmpMod) {
-    AccessPath.push_back({ Ctx.getIdentifier(TmpMod->Name), SourceLoc() });
+    importPath.push_back(Ctx.getIdentifier(TmpMod->Name));
     TmpMod = TmpMod->Parent;
   }
-  std::reverse(AccessPath.begin(), AccessPath.end());
+  std::reverse(importPath.begin(), importPath.end());
 
   bool IsExported = false;
   for (auto *ExportedMod : Exported) {
@@ -2834,8 +2882,8 @@ ImportDecl *swift::createImportDecl(ASTContext &Ctx,
   }
 
   auto *ID = ImportDecl::create(Ctx, DC, SourceLoc(),
-                                ImportKind::Module, SourceLoc(), AccessPath,
-                                ClangN);
+                                ImportKind::Module, SourceLoc(),
+                                importPath.get(), ClangN);
   if (IsExported)
     ID->getAttrs().add(new (Ctx) ExportedAttr(/*IsImplicit=*/false));
   return ID;
@@ -2889,11 +2937,12 @@ void ClangModuleUnit::lookupValue(DeclName name, NLKind lookupKind,
 bool ClangImporter::Implementation::isVisibleClangEntry(
     const clang::NamedDecl *clangDecl) {
   // For a declaration, check whether the declaration is hidden.
-  if (!clangDecl->isHidden()) return true;
+  clang::Sema &clangSema = getClangSema();
+  if (clangSema.isVisible(clangDecl)) return true;
 
   // Is any redeclaration visible?
   for (auto redecl : clangDecl->redecls()) {
-    if (!cast<clang::NamedDecl>(redecl)->isHidden()) return true;
+    if (clangSema.isVisible(cast<clang::NamedDecl>(redecl))) return true;
   }
 
   return false;
@@ -3004,8 +3053,10 @@ void ClangImporter::loadExtensions(NominalTypeDecl *nominal,
     SmallVector<clang::NamedDecl *, 4> DelayedCategories;
 
     // Simply importing the categories adds them to the list of extensions.
-    for (const auto *Cat : objcClass->visible_categories()) {
-      Impl.importDeclReal(Cat, Impl.CurrentVersion);
+    for (const auto *Cat : objcClass->known_categories()) {
+      if (getClangSema().isVisible(Cat)) {
+        Impl.importDeclReal(Cat, Impl.CurrentVersion);
+      }
     }
   }
 
@@ -3075,7 +3126,7 @@ void ClangImporter::loadObjCMethods(
 }
 
 void
-ClangModuleUnit::lookupClassMember(ModuleDecl::AccessPathTy accessPath,
+ClangModuleUnit::lookupClassMember(ImportPath::Access accessPath,
                                    DeclName name,
                                    SmallVectorImpl<ValueDecl*> &results) const {
   // FIXME: Ignore submodules, which are empty for now.
@@ -3091,7 +3142,7 @@ ClangModuleUnit::lookupClassMember(ModuleDecl::AccessPathTy accessPath,
   }
 }
 
-void ClangModuleUnit::lookupClassMembers(ModuleDecl::AccessPathTy accessPath,
+void ClangModuleUnit::lookupClassMembers(ImportPath::Access accessPath,
                                          VisibleDeclConsumer &consumer) const {
   // FIXME: Ignore submodules, which are empty for now.
   if (clangModule && clangModule->isSubModule())
@@ -3309,7 +3360,7 @@ StringRef ClangModuleUnit::getModuleDefiningPath() const {
   return clangSourceMgr.getFilename(clangModule->DefinitionLoc);
 }
 
-Optional<clang::ExternalASTSource::ASTSourceDescriptor>
+Optional<clang::ASTSourceDescriptor>
 ClangModuleUnit::getASTSourceDescriptor() const {
   if (clangModule) {
     assert(ASTSourceDescriptor.getModuleOrNull() == clangModule);
@@ -3363,8 +3414,7 @@ ModuleDecl *ClangModuleUnit::getOverlayModule() const {
     // FIXME: Include proper source location.
     ModuleDecl *M = getParentModule();
     ASTContext &Ctx = M->getASTContext();
-    auto overlay = Ctx.getModule(ModuleDecl::AccessPathTy({M->getName(),
-                                                           SourceLoc()}));
+    auto overlay = Ctx.getModuleByIdentifier(M->getName());
     if (overlay == M) {
       overlay = nullptr;
     } else {
@@ -3384,21 +3434,23 @@ ModuleDecl *ClangModuleUnit::getOverlayModule() const {
 }
 
 void ClangModuleUnit::getImportedModules(
-    SmallVectorImpl<ModuleDecl::ImportedModule> &imports,
+    SmallVectorImpl<ImportedModule> &imports,
     ModuleDecl::ImportFilter filter) const {
   // Bail out if we /only/ want ImplementationOnly imports; Clang modules never
   // have any of these.
   if (filter.containsOnly(ModuleDecl::ImportFilterKind::ImplementationOnly))
     return;
 
-  if (filter.contains(ModuleDecl::ImportFilterKind::Private))
+  // [NOTE: Pure-Clang-modules-privately-import-stdlib]:
+  // Needed for implicitly synthesized conformances.
+  if (filter.contains(ModuleDecl::ImportFilterKind::Default))
     if (auto stdlib = owner.getStdlibModule())
-      imports.push_back({ModuleDecl::AccessPathTy(), stdlib});
+      imports.push_back({ImportPath::Access(), stdlib});
 
   SmallVector<clang::Module *, 8> imported;
   if (!clangModule) {
     // This is the special "imported headers" module.
-    if (filter.contains(ModuleDecl::ImportFilterKind::Public)) {
+    if (filter.contains(ModuleDecl::ImportFilterKind::Exported)) {
       imported.append(owner.ImportedHeaderExports.begin(),
                       owner.ImportedHeaderExports.end());
     }
@@ -3406,11 +3458,11 @@ void ClangModuleUnit::getImportedModules(
   } else {
     clangModule->getExportedModules(imported);
 
-    if (filter.contains(ModuleDecl::ImportFilterKind::Private)) {
+    if (filter.contains(ModuleDecl::ImportFilterKind::Default)) {
       // Copy in any modules that are imported but not exported.
       llvm::SmallPtrSet<clang::Module *, 8> knownModules(imported.begin(),
                                                          imported.end());
-      if (!filter.contains(ModuleDecl::ImportFilterKind::Public)) {
+      if (!filter.contains(ModuleDecl::ImportFilterKind::Exported)) {
         // Remove the exported ones now that we're done with them.
         imported.clear();
       }
@@ -3438,7 +3490,7 @@ void ClangModuleUnit::getImportedModules(
       if (importTopLevel != importMod) {
         if (!clangModule || importTopLevel != clangModule->getTopLevelModule()){
           auto topLevelWrapper = owner.getWrapperForModule(importTopLevel);
-          imports.push_back({ ModuleDecl::AccessPathTy(),
+          imports.push_back({ ImportPath::Access(),
                               topLevelWrapper->getParentModule() });
         }
       }
@@ -3448,12 +3500,12 @@ void ClangModuleUnit::getImportedModules(
     }
 
     assert(actualMod && "Missing imported overlay");
-    imports.push_back({ModuleDecl::AccessPathTy(), actualMod});
+    imports.push_back({ImportPath::Access(), actualMod});
   }
 }
 
 void ClangModuleUnit::getImportedModulesForLookup(
-    SmallVectorImpl<ModuleDecl::ImportedModule> &imports) const {
+    SmallVectorImpl<ImportedModule> &imports) const {
 
   // Reuse our cached list of imports if we have one.
   if (importedModulesForLookup.hasValue()) {
@@ -3478,7 +3530,7 @@ void ClangModuleUnit::getImportedModulesForLookup(
   }
 
   if (imported.empty()) {
-    importedModulesForLookup = ArrayRef<ModuleDecl::ImportedModule>();
+    importedModulesForLookup = ArrayRef<ImportedModule>();
     return;
   }
 
@@ -3524,7 +3576,7 @@ void ClangModuleUnit::getImportedModulesForLookup(
       actualMod = wrapper->getParentModule();
 
     assert(actualMod && "Missing imported overlay");
-    imports.push_back({ModuleDecl::AccessPathTy(), actualMod});
+    imports.push_back({ImportPath::Access(), actualMod});
   }
 
   // Cache our results for use next time.
@@ -3537,7 +3589,13 @@ void ClangImporter::getMangledName(raw_ostream &os,
   if (!Impl.Mangler)
     Impl.Mangler.reset(Impl.getClangASTContext().createMangleContext());
 
-  Impl.Mangler->mangleName(clangDecl, os);
+  if (auto ctor = dyn_cast<clang::CXXConstructorDecl>(clangDecl)) {
+    auto ctorGlobalDecl =
+        clang::GlobalDecl(ctor, clang::CXXCtorType::Ctor_Complete);
+    Impl.Mangler->mangleCXXName(ctorGlobalDecl, os);
+  } else {
+    Impl.Mangler->mangleName(clangDecl, os);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3586,6 +3644,18 @@ void ClangImporter::Implementation::lookupValue(
        VisibleDeclConsumer &consumer) {
   auto &clangCtx = getClangASTContext();
   auto clangTU = clangCtx.getTranslationUnitDecl();
+
+  // For operators we have to look up static member functions in addition to the
+  // top-level function lookup below.
+  if (name.isOperator()) {
+    for (auto entry : table.lookupMemberOperators(name.getBaseName())) {
+      if (isVisibleClangEntry(entry)) {
+        if (auto decl = dyn_cast<ValueDecl>(
+                importDeclReal(entry->getMostRecentDecl(), CurrentVersion)))
+          consumer.foundDecl(decl, DeclVisibilityKind::VisibleAtTopLevel);
+      }
+    }
+  }
 
   for (auto entry : table.lookup(name.getBaseName(), clangTU)) {
     // If the entry is not visible, skip it.
@@ -3637,41 +3707,46 @@ void ClangImporter::Implementation::lookupValue(
 
     // If we have a declaration and nothing matched so far, try the names used
     // in other versions of Swift.
-    if (!anyMatching) {
-      if (auto clangDecl = entry.dyn_cast<clang::NamedDecl *>()) {
-        const clang::NamedDecl *recentClangDecl =
-            clangDecl->getMostRecentDecl();
+    if (auto clangDecl = entry.dyn_cast<clang::NamedDecl *>()) {
+      const clang::NamedDecl *recentClangDecl =
+          clangDecl->getMostRecentDecl();
 
-        CurrentVersion.forEachOtherImportNameVersion(
-            [&](ImportNameVersion nameVersion) {
-          if (anyMatching)
-            return;
+      CurrentVersion.forEachOtherImportNameVersion(
+          SwiftContext.LangOpts.EnableExperimentalConcurrency,
+          [&](ImportNameVersion nameVersion) {
+        if (anyMatching)
+          return;
 
-          // Check to see if the name and context match what we expect.
-          ImportedName newName = importFullName(recentClangDecl, nameVersion);
-          if (!newName.getDeclName().matchesRef(name))
-            return;
+        // Check to see if the name and context match what we expect.
+        ImportedName newName = importFullName(recentClangDecl, nameVersion);
+        if (!newName.getDeclName().matchesRef(name))
+          return;
 
-          const clang::DeclContext *clangDC =
-              newName.getEffectiveContext().getAsDeclContext();
-          if (!clangDC || !clangDC->isFileContext())
-            return;
+        // If we asked for an async import and didn't find one, skip this.
+        // This filters out duplicates.
+        if (nameVersion.supportsConcurrency() &&
+            !newName.getAsyncInfo())
+          return;
 
-          // Then try to import the decl under the alternate name.
-          auto alternateNamedDecl =
-              cast_or_null<ValueDecl>(importDeclReal(recentClangDecl,
-                                                     nameVersion));
-          if (!alternateNamedDecl || alternateNamedDecl == decl)
-            return;
-          assert(alternateNamedDecl->getName().matchesRef(name) &&
-                 "importFullName behaved differently from importDecl");
-          if (alternateNamedDecl->getDeclContext()->isModuleScopeContext()) {
-            consumer.foundDecl(alternateNamedDecl,
-                               DeclVisibilityKind::VisibleAtTopLevel);
-            anyMatching = true;
-          }
-        });
-      }
+        const clang::DeclContext *clangDC =
+            newName.getEffectiveContext().getAsDeclContext();
+        if (!clangDC || !clangDC->isFileContext())
+          return;
+
+        // Then try to import the decl under the alternate name.
+        auto alternateNamedDecl =
+            cast_or_null<ValueDecl>(importDeclReal(recentClangDecl,
+                                                   nameVersion));
+        if (!alternateNamedDecl || alternateNamedDecl == decl)
+          return;
+        assert(alternateNamedDecl->getName().matchesRef(name) &&
+               "importFullName behaved differently from importDecl");
+        if (alternateNamedDecl->getDeclContext()->isModuleScopeContext()) {
+          consumer.foundDecl(alternateNamedDecl,
+                             DeclVisibilityKind::VisibleAtTopLevel);
+          anyMatching = true;
+        }
+      });
     }
   }
 }
@@ -4006,3 +4081,32 @@ swift::getModuleCachePathFromClang(const clang::CompilerInstance &Clang) {
   return llvm::sys::path::parent_path(SpecificModuleCachePath).str();
 }
 
+clang::FunctionDecl *ClangImporter::instantiateCXXFunctionTemplate(
+    ASTContext &ctx, clang::FunctionTemplateDecl *func, SubstitutionMap subst) {
+  SmallVector<clang::TemplateArgument, 4> templateSubst;
+  std::unique_ptr<TemplateInstantiationError> error =
+      ctx.getClangTemplateArguments(func->getTemplateParameters(),
+                                    subst.getReplacementTypes(), templateSubst);
+  if (error) {
+    std::string failedTypesStr;
+    llvm::raw_string_ostream failedTypesStrStream(failedTypesStr);
+    llvm::interleaveComma(error->failedTypes, failedTypesStrStream);
+    // TODO: Use the location of the apply here.
+    // TODO: This error message should not reference implementation details.
+    // See: https://github.com/apple/swift/pull/33053#discussion_r477003350
+    ctx.Diags.diagnose(SourceLoc(),
+                       diag::unable_to_convert_generic_swift_types.ID,
+                       {func->getName(), StringRef(failedTypesStr)});
+    // Return a valid FunctionDecl but, we'll never use it.
+    return func->getAsFunction();
+  }
+
+  // Instanciate a specialization of this template using the substitution map.
+  auto *templateArgList = clang::TemplateArgumentList::CreateCopy(
+      func->getASTContext(), templateSubst);
+  auto &sema = getClangInstance().getSema();
+  auto *spec = sema.InstantiateFunctionDeclaration(func, templateArgList,
+                                                   clang::SourceLocation());
+  sema.InstantiateFunctionDefinition(clang::SourceLocation(), spec);
+  return spec;
+}

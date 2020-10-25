@@ -21,11 +21,16 @@
 #ifndef SWIFT_SIL_APPLYSITE_H
 #define SWIFT_SIL_APPLYSITE_H
 
+#include "swift/Basic/STLExtras.h"
+#include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
-#include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILFunction.h"
+#include "swift/SIL/SILInstruction.h"
+#include "llvm/ADT/ArrayRef.h"
 
 namespace swift {
+
+class FullApplySite;
 
 //===----------------------------------------------------------------------===//
 //                                 ApplySite
@@ -394,6 +399,10 @@ public:
     llvm_unreachable("covered switch");
   }
 
+  /// Returns true if \p op is an operand that passes an indirect
+  /// result argument to the apply site.
+  bool isIndirectResultOperand(const Operand &op) const;
+
   /// Return whether the given apply is of a formally-throwing function
   /// which is statically known not to throw.
   bool isNonThrowing() const {
@@ -423,6 +432,10 @@ public:
   }
 
   void dump() const LLVM_ATTRIBUTE_USED { getInstruction()->dump(); }
+
+  /// Attempt to cast this apply site to a full apply site, returning None on
+  /// failure.
+  Optional<FullApplySite> asFullApplySite() const;
 };
 
 //===----------------------------------------------------------------------===//
@@ -502,6 +515,34 @@ public:
     return getSubstCalleeConv().hasIndirectSILResults();
   }
 
+  /// If our apply site has a single direct result SILValue, return that
+  /// SILValue. Return SILValue() otherwise.
+  ///
+  /// This means that:
+  ///
+  /// 1. If we have an ApplyInst, we just visit the apply.
+  /// 2. If we have a TryApplyInst, we visit the first argument of the normal
+  ///    block.
+  /// 3. If we have a BeginApplyInst, we return SILValue() since the begin_apply
+  ///    yields values instead of returning them. A returned value should only
+  ///    be valid after a full apply site has completely finished executing.
+  SILValue getSingleDirectResult() const {
+    switch (getKind()) {
+    case FullApplySiteKind::ApplyInst:
+      return SILValue(cast<ApplyInst>(getInstruction()));
+    case FullApplySiteKind::BeginApplyInst: {
+      return SILValue();
+    }
+    case FullApplySiteKind::TryApplyInst: {
+      auto *normalBlock = cast<TryApplyInst>(getInstruction())->getNormalBB();
+      assert(normalBlock->getNumArguments() == 1 &&
+             "Expected try apply to have a single result");
+      return normalBlock->getArgument(0);
+    }
+    }
+    llvm_unreachable("Covered switch isn't covered?!");
+  }
+
   unsigned getNumIndirectSILResults() const {
     return getSubstCalleeConv().getNumIndirectSILResults();
   }
@@ -532,12 +573,6 @@ public:
     return op.getOperandNumber() < getOperandIndexOfFirstArgument();
   }
 
-  /// Returns true if \p op is an operand that passes an indirect
-  /// result argument to the apply site.
-  bool isIndirectResultOperand(const Operand &op) const {
-    return getCalleeArgIndex(op) < getNumIndirectSILResults();
-  }
-
   /// Is this an ApplySite that begins the evaluation of a coroutine.
   bool beginsCoroutineEvaluation() const {
     switch (getKind()) {
@@ -550,61 +585,33 @@ public:
     llvm_unreachable("Covered switch isn't covered?!");
   }
 
-  /// If this is a terminator apply site, then pass the first instruction of
-  /// each successor to fun. Otherwise, pass std::next(Inst).
+  /// If this is a terminator apply site, then pass a builder to insert at the
+  /// first instruction of each successor to \p func. Otherwise, pass a builder
+  /// to insert at std::next(Inst).
   ///
   /// The intention is that this abstraction will enable the compiler writer to
   /// ignore whether or not an apply site is a terminator when inserting
   /// instructions after an apply site. This results in eliminating unnecessary
   /// if-else code otherwise required to handle such situations.
   ///
-  /// NOTE: We return std::next() for begin_apply. If one wishes to insert code
+  /// NOTE: We pass std::next() for begin_apply. If one wishes to insert code
   /// /after/ the end_apply/abort_apply, please use instead
   /// insertAfterFullEvaluation.
-  void insertAfterInvocation(
-      function_ref<void(SILBasicBlock::iterator)> func) const {
-    switch (getKind()) {
-    case FullApplySiteKind::ApplyInst:
-    case FullApplySiteKind::BeginApplyInst:
-      return func(std::next(getInstruction()->getIterator()));
-    case FullApplySiteKind::TryApplyInst:
-      for (auto *succBlock :
-           cast<TermInst>(getInstruction())->getSuccessorBlocks()) {
-        func(succBlock->begin());
-      }
-      return;
-    }
-    llvm_unreachable("Covered switch isn't covered");
-  }
+  void insertAfterInvocation(function_ref<void(SILBuilder &)> func) const;
 
-  /// Pass to func insertion points that are guaranteed to be immediately after
-  /// this full apply site has completely finished executing.
+  /// Pass a builder with insertion points that are guaranteed to be immediately
+  /// after this full apply site has completely finished executing.
   ///
   /// This is just like insertAfterInvocation except that if the full apply site
   /// is a begin_apply, we pass the insertion points after the end_apply,
   /// abort_apply rather than an insertion point right after the
   /// begin_apply. For such functionality, please invoke insertAfterInvocation.
-  void insertAfterFullEvaluation(
-      function_ref<void(SILBasicBlock::iterator)> func) const {
-    switch (getKind()) {
-    case FullApplySiteKind::ApplyInst:
-    case FullApplySiteKind::TryApplyInst:
-      return insertAfterInvocation(func);
-    case FullApplySiteKind::BeginApplyInst:
-      SmallVector<EndApplyInst *, 2> endApplies;
-      SmallVector<AbortApplyInst *, 2> abortApplies;
-      auto *bai = cast<BeginApplyInst>(getInstruction());
-      bai->getCoroutineEndPoints(endApplies, abortApplies);
-      for (auto *eai : endApplies) {
-        func(std::next(eai->getIterator()));
-      }
-      for (auto *aai : abortApplies) {
-        func(std::next(aai->getIterator()));
-      }
-      return;
-    }
+  void insertAfterFullEvaluation(function_ref<void(SILBuilder &)> func) const;
 
-    llvm_unreachable("covered switch isn't covered");
+  /// Returns true if \p op is an operand that passes an indirect
+  /// result argument to the apply site.
+  bool isIndirectResultOperand(const Operand &op) const {
+    return getCalleeArgIndex(op) < getNumIndirectSILResults();
   }
 
   static FullApplySite getFromOpaqueValue(void *p) { return FullApplySite(p); }
@@ -698,5 +705,24 @@ template <> struct DenseMapInfo<::swift::FullApplySite> {
 };
 
 } // namespace llvm
+
+//===----------------------------------------------------------------------===//
+//           Inline Definitions to work around Forward Declaration
+//===----------------------------------------------------------------------===//
+
+namespace swift {
+
+inline Optional<FullApplySite> ApplySite::asFullApplySite() const {
+  return FullApplySite::isa(getInstruction());
+}
+
+inline bool ApplySite::isIndirectResultOperand(const Operand &op) const {
+  auto fas = asFullApplySite();
+  if (!fas)
+    return false;
+  return fas->isIndirectResultOperand(op);
+}
+
+} // namespace swift
 
 #endif

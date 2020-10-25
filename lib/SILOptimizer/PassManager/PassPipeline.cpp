@@ -222,7 +222,7 @@ void addHighLevelLoopOptPasses(SILPassPipelinePlan &P) {
   // Perform classic SSA optimizations for cleanup.
   P.addLowerAggregateInstrs();
   P.addSILCombine();
-  P.addSROA();
+  P.addEarlySROA();
   P.addMem2Reg();
   P.addDCE();
   P.addSILCombine();
@@ -283,14 +283,26 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   // splits up copy_addr.
   P.addCopyForwarding();
 
+  // Optimize copies from a temporary (an "l-value") to a destination.
+  P.addTempLValueOpt();
+
   // Split up opaque operations (copy_addr, retain_value, etc.).
   P.addLowerAggregateInstrs();
 
   // Split up operations on stack-allocated aggregates (struct, tuple).
-  P.addSROA();
+  if (OpLevel == OptimizationLevelKind::HighLevel) {
+    P.addEarlySROA();
+  } else {
+    P.addSROA();
+  }
 
   // Promote stack allocations to values.
   P.addMem2Reg();
+
+  // We earlier eliminated ownership if we are not compiling the stdlib. Now
+  // handle the stdlib functions, re-simplifying, eliminating ARC as we do.
+  P.addSemanticARCOpts();
+  P.addNonTransparentFunctionOwnershipModelEliminator();
 
   // Run the existential specializer Pass.
   P.addExistentialSpecializer();
@@ -382,6 +394,7 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   P.addEarlyCodeMotion();
   P.addReleaseHoisting();
   P.addARCSequenceOpts();
+  P.addTempRValueOpt();
 
   P.addSimplifyCFG();
   if (OpLevel == OptimizationLevelKind::LowLevel) {
@@ -411,6 +424,11 @@ static void addPerfDebugSerializationPipeline(SILPassPipelinePlan &P) {
 static void addPrepareOptimizationsPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("PrepareOptimizationPasses");
 
+  // Verify AccessedStorage once in OSSA before optimizing.
+#ifndef NDEBUG
+  P.addAccessPathVerification();
+#endif
+
   P.addForEachLoopUnroll();
   P.addMandatoryCombine();
   P.addAccessMarkerElimination();
@@ -433,8 +451,17 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
   // not blocked by any other passes' optimizations, so do it early.
   P.addDifferentiabilityWitnessDevirtualizer();
 
-  // Strip ownership from non-transparent functions.
-  P.addNonTransparentFunctionOwnershipModelEliminator();
+  // Strip ownership from non-transparent functions when we are not compiling
+  // the stdlib module. When compiling the stdlib, we eliminate ownership on
+  // these functions later with a nromal call to
+  // P.addNonTransparentFunctionOwnershipModelEliminator().
+  //
+  // This is done so we can push ownership through the pass pipeline first for
+  // the stdlib and then everything else.
+  if (P.getOptions().StopOptimizationBeforeLoweringOwnership)
+    return;
+
+  P.addNonStdlibNonTransparentFunctionOwnershipModelEliminator();
 
   // Start by linking in referenced functions from other modules.
   P.addPerformanceSILLinker();
@@ -443,6 +470,10 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
   // temp-rvalue opt is here so that we can hit copies from non-ossa code that
   // is linked in from the stdlib.
   P.addTempRValueOpt();
+
+  // Needed to serialize static initializers of globals for cross-module
+  // optimization.
+  P.addGlobalOpt();
 
   // Add the outliner pass (Osize).
   P.addOutliner();
@@ -468,9 +499,13 @@ static void addHighLevelFunctionPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("HighLevel,Function+EarlyLoopOpt");
   // FIXME: update EagerSpecializer to be a function pass!
   P.addEagerSpecializer();
+
+  // stdlib ownership model elimination is done within addFunctionPasses
   addFunctionPasses(P, OptimizationLevelKind::HighLevel);
 
   addHighLevelLoopOptPasses(P);
+  
+  P.addStringOptimization();
 }
 
 // After "high-level" function passes have processed the entire call tree, run
@@ -506,6 +541,7 @@ static void addSerializePipeline(SILPassPipelinePlan &P) {
 
 static void addMidLevelFunctionPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("MidLevel,Function", true /*isFunctionPassPipeline*/);
+
   addFunctionPasses(P, OptimizationLevelKind::MidLevel);
 
   // Specialize partially applied functions with dead arguments as a preparation
@@ -640,8 +676,18 @@ static void addLastChanceOptPassPipeline(SILPassPipelinePlan &P) {
   // A loop might have only one dynamic access now, i.e. hoistable
   P.addLICM();
 
+  // Verify AccessedStorage once again after optimizing and lowering OSSA.
+#ifndef NDEBUG
+  P.addAccessPathVerification();
+#endif
+
   // Only has an effect if the -assume-single-thread option is specified.
   P.addAssumeSingleThreaded();
+
+  // Only has an effect if opt-remark is enabled.
+  P.addOptRemarkGenerator();
+
+  P.addPruneVTables();
 }
 
 static void addSILDebugInfoGeneratorPipeline(SILPassPipelinePlan &P) {
@@ -691,12 +737,21 @@ SILPassPipelinePlan::getPerformancePassPipeline(const SILOptions &Options) {
 
   // Eliminate immediately dead functions and then clone functions from the
   // stdlib.
+  //
+  // This also performs early OSSA based optimizations on *all* swift code.
   addPerfEarlyModulePassPipeline(P);
+
+  // Then if we were asked to stop optimization before lowering OSSA (causing us
+  // to exit early from addPerfEarlyModulePassPipeline), exit early.
+  if (P.getOptions().StopOptimizationBeforeLoweringOwnership)
+    return P;
 
   // Then run an iteration of the high-level SSA passes.
   //
   // FIXME: When *not* emitting a .swiftmodule, skip the high-level function
   // pipeline to save compile time.
+  //
+  // NOTE: Ownership is now stripped within this function for the stdlib.
   addHighLevelFunctionPipeline(P);
 
   addHighLevelModulePipeline(P);
@@ -762,6 +817,9 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
 
   // Has only an effect if the -assume-single-thread option is specified.
   P.addAssumeSingleThreaded();
+
+  // Create pre-specializations.
+  P.addOnonePrespecializations();
 
   // Has only an effect if the -gsil option is specified.
   P.addSILDebugInfoGenerator();

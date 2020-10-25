@@ -28,24 +28,29 @@
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/ProtocolConformanceRef.h"
+#include "swift/AST/SILLayout.h"
 #include "swift/Basic/Defer.h"
+#include "swift/ClangImporter/ClangImporter.h"
+#include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/Demangling/ManglingUtils.h"
-#include "swift/Demangling/Demangler.h"
 #include "swift/Strings.h"
 #include "clang/AST/ASTContext.h"
-#include "clang/Basic/CharInfo.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclObjC.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Mangle.h"
+#include "clang/Basic/CharInfo.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/CommandLine.h"
+
+#include <memory>
 
 using namespace swift;
 using namespace swift::Mangle;
@@ -334,21 +339,29 @@ std::string ASTMangler::mangleKeyPathHashHelper(ArrayRef<CanType> indices,
   return finalize();
 }
 
-std::string ASTMangler::mangleGlobalInit(const VarDecl *decl, int counter,
+std::string ASTMangler::mangleGlobalInit(const PatternBindingDecl *pd,
+                                         unsigned pbdEntry,
                                          bool isInitFunc) {
-  auto topLevelContext = decl->getDeclContext()->getModuleScopeContext();
-  auto fileUnit = cast<FileUnit>(topLevelContext);
-  Identifier discriminator = fileUnit->getDiscriminatorForPrivateValue(decl);
-  assert(!discriminator.empty());
-  assert(!isNonAscii(discriminator.str()) &&
-         "discriminator contains non-ASCII characters");
-  assert(!clang::isDigit(discriminator.str().front()) &&
-         "not a valid identifier");
-
-  Buffer << "globalinit_";
-  appendIdentifier(discriminator.str());
-  Buffer << (isInitFunc ? "_func" : "_token");
-  Buffer << counter;
+  beginMangling();
+  
+  Pattern *pattern = pd->getPattern(pbdEntry);
+  bool first = true;
+  pattern->forEachVariable([&](VarDecl *D) {
+    if (first) {
+      appendContextOf(D);
+      first = false;
+    }
+    appendDeclName(D);
+    appendListSeparator();
+  });
+  assert(!first && "no variables in pattern binding?!");
+  
+  if (isInitFunc) {
+    appendOperator("WZ");
+  } else {
+    appendOperator("Wz");
+  }
+  
   return finalize();
 }
 
@@ -529,6 +542,12 @@ std::string ASTMangler::mangleTypeForDebugger(Type Ty, const DeclContext *DC) {
 
   appendType(Ty);
   appendOperator("D");
+  return finalize();
+}
+
+std::string ASTMangler::mangleTypeForTypeName(Type type) {
+  beginManglingWithoutPrefix();
+  appendType(type);
   return finalize();
 }
 
@@ -734,23 +753,12 @@ static bool getUnnamedParamIndex(const ParameterList *ParamList,
 }
 
 static unsigned getUnnamedParamIndex(const ParamDecl *D) {
-  if (auto SD = dyn_cast<SubscriptDecl>(D->getDeclContext())) {
-    unsigned UnnamedIndex = 0;
-    auto *ParamList = SD->getIndices();
-    if (getUnnamedParamIndex(ParamList, D, UnnamedIndex))
-      return UnnamedIndex;
-    llvm_unreachable("param not found");
-  }
-
   ParameterList *ParamList;
-
-  if (auto AFD = dyn_cast<AbstractFunctionDecl>(D->getDeclContext())) {
-    ParamList = AFD->getParameters();
-  } else if (auto EED = dyn_cast<EnumElementDecl>(D->getDeclContext())) {
-    ParamList = EED->getParameterList();
+  auto *DC = D->getDeclContext();
+  if (isa<AbstractClosureExpr>(DC)) {
+    ParamList = cast<AbstractClosureExpr>(DC)->getParameters();
   } else {
-    auto ACE = cast<AbstractClosureExpr>(D->getDeclContext());
-    ParamList = ACE->getParameters();
+    ParamList = getParameterList(cast<ValueDecl>(DC->getAsDecl()));
   }
 
   unsigned UnnamedIndex = 0;
@@ -918,6 +926,7 @@ void ASTMangler::appendType(Type type, const ValueDecl *forDecl) {
   TypeBase *tybase = type.getPointer();
   switch (type->getKind()) {
     case TypeKind::TypeVariable:
+    case TypeKind::Hole:
       llvm_unreachable("mangling type variable");
 
     case TypeKind::Module:
@@ -1647,15 +1656,35 @@ void ASTMangler::appendImplFunctionType(SILFunctionType *fn) {
     OpArgs.push_back('t');
   }
 
+  bool mangleClangType = fn->getASTContext().LangOpts.UseClangFunctionTypes &&
+                         fn->hasNonDerivableClangType();
+
+  auto appendClangTypeToVec = [this, fn](auto &Vec) {
+    llvm::raw_svector_ostream OpArgsOS(Vec);
+    appendClangType(fn, OpArgsOS);
+  };
+
   switch (fn->getRepresentation()) {
     case SILFunctionTypeRepresentation::Thick:
     case SILFunctionTypeRepresentation::Thin:
       break;
     case SILFunctionTypeRepresentation::Block:
+      if (!mangleClangType) {
+        OpArgs.push_back('B');
+        break;
+      }
+      OpArgs.push_back('z');
       OpArgs.push_back('B');
+      appendClangTypeToVec(OpArgs);
       break;
     case SILFunctionTypeRepresentation::CFunctionPointer:
+      if (!mangleClangType) {
+        OpArgs.push_back('C');
+        break;
+      }
+      OpArgs.push_back('z');
       OpArgs.push_back('C');
+      appendClangTypeToVec(OpArgs);
       break;
     case SILFunctionTypeRepresentation::ObjCMethod:
       OpArgs.push_back('O');
@@ -1681,6 +1710,11 @@ void ASTMangler::appendImplFunctionType(SILFunctionType *fn) {
   case SILCoroutineKind::YieldMany:
     OpArgs.push_back('G');
     break;
+  }
+
+  // Asynchronous functions.
+  if (fn->isAsync()) {
+    OpArgs.push_back('H');
   }
 
   auto outerGenericSig = CurGenericSignature;
@@ -1833,7 +1867,7 @@ namespace {
     VarDecl *visitParenPattern(ParenPattern *P) {
       return visit(P->getSubPattern());
     }
-    VarDecl *visitVarPattern(VarPattern *P) {
+    VarDecl *visitBindingPattern(BindingPattern *P) {
       return visit(P->getSubPattern());
     }
     VarDecl *visitTypedPattern(TypedPattern *P) {
@@ -2118,6 +2152,7 @@ void ASTMangler::appendAnyGenericType(const GenericTypeDecl *decl) {
   // Always use Clang names for imported Clang declarations, unless they don't
   // have one.
   auto tryAppendClangName = [this, decl]() -> bool {
+    auto *nominal = dyn_cast<NominalTypeDecl>(decl);
     auto namedDecl = getClangDeclForMangling(decl);
     if (!namedDecl)
       return false;
@@ -2130,6 +2165,13 @@ void ASTMangler::appendAnyGenericType(const GenericTypeDecl *decl) {
       appendIdentifier(interface->getObjCRuntimeNameAsString());
     } else if (UseObjCRuntimeNames && protocol) {
       appendIdentifier(protocol->getObjCRuntimeNameAsString());
+    } else if (auto ctsd = dyn_cast<clang::ClassTemplateSpecializationDecl>(namedDecl)) {
+      // If this is a `ClassTemplateSpecializationDecl`, it was
+      // imported as a Swift decl with `__CxxTemplateInst...` name.
+      // `ClassTemplateSpecializationDecl`'s name does not include information about
+      // template arguments, and in order to prevent name clashes we use the
+      // name of the Swift decl which does include template arguments.
+      appendIdentifier(nominal->getName().str());
     } else {
       appendIdentifier(namedDecl->getName());
     }
@@ -2225,6 +2267,9 @@ void ASTMangler::appendFunctionType(AnyFunctionType *fn, bool isAutoClosure,
 
   appendFunctionSignature(fn, forDecl);
 
+  bool mangleClangType = fn->getASTContext().LangOpts.UseClangFunctionTypes &&
+                         fn->hasNonDerivableClangType();
+
   // Note that we do not currently use thin representations in the AST
   // for the types of function decls.  This may need to change at some
   // point, in which case the uncurry logic can probably migrate to that
@@ -2237,6 +2282,10 @@ void ASTMangler::appendFunctionType(AnyFunctionType *fn, bool isAutoClosure,
   // changes to better support thin functions.
   switch (fn->getRepresentation()) {
   case AnyFunctionType::Representation::Block:
+    if (mangleClangType) {
+      appendOperator("XzB");
+      return appendClangType(fn);
+    }
     // We distinguish escaping and non-escaping blocks, but only in the DWARF
     // mangling, because the ABI is already set.
     if (!fn->isNoEscape() && DWARFMangling)
@@ -2268,15 +2317,38 @@ void ASTMangler::appendFunctionType(AnyFunctionType *fn, bool isAutoClosure,
     return appendOperator("c");
 
   case AnyFunctionType::Representation::CFunctionPointer:
+    if (mangleClangType) {
+      appendOperator("XzC");
+      return appendClangType(fn);
+    }
     return appendOperator("XC");
   }
+}
+
+template <typename FnType>
+void ASTMangler::appendClangType(FnType *fn, llvm::raw_svector_ostream &out) {
+  auto clangType = fn->getClangTypeInfo().getType();
+  SmallString<64> scratch;
+  llvm::raw_svector_ostream scratchOS(scratch);
+  clang::ASTContext &clangCtx =
+      fn->getASTContext().getClangModuleLoader()->getClangASTContext();
+  std::unique_ptr<clang::ItaniumMangleContext> mangler{
+      clang::ItaniumMangleContext::create(clangCtx, clangCtx.getDiagnostics())};
+  mangler->mangleTypeName(clang::QualType(clangType, 0), scratchOS);
+  out << scratchOS.str().size() << scratchOS.str();
+}
+
+void ASTMangler::appendClangType(AnyFunctionType *fn) {
+  appendClangType(fn, Buffer);
 }
 
 void ASTMangler::appendFunctionSignature(AnyFunctionType *fn,
                                          const ValueDecl *forDecl) {
   appendFunctionResultType(fn->getResult(), forDecl);
   appendFunctionInputType(fn->getParams(), forDecl);
-  if (fn->throws())
+  if (fn->isAsync())
+    appendOperator("Y");
+  if (fn->isThrowing())
     appendOperator("K");
 }
 
@@ -2741,7 +2813,7 @@ void ASTMangler::appendConstructorEntity(const ConstructorDecl *ctor,
 }
 
 void ASTMangler::appendDestructorEntity(const DestructorDecl *dtor,
-                                     bool isDeallocating) {
+                                        bool isDeallocating) {
   appendContextOf(dtor);
   appendOperator(isDeallocating ? "fD" : "fd");
 }

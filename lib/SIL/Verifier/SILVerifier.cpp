@@ -52,14 +52,6 @@ using namespace swift::silverifier;
 
 using Lowering::AbstractionPattern;
 
-// This flag is used only to check that sil-combine can properly
-// remove any code after unreachable, thus bringing SIL into
-// its canonical form which may get temporarily broken during
-// intermediate transformations.
-static llvm::cl::opt<bool> SkipUnreachableMustBeLastErrors(
-                              "verify-skip-unreachable-must-be-last",
-                              llvm::cl::init(false));
-
 // This flag controls the default behaviour when hitting a verification
 // failure (abort/exit).
 static llvm::cl::opt<bool> AbortOnFailure(
@@ -670,9 +662,9 @@ class SILVerifier : public SILVerifierBase<SILVerifier> {
 
   // Used for dominance checking within a basic block.
   llvm::DenseMap<const SILInstruction *, unsigned> InstNumbers;
-
+  
   DeadEndBlocks DEBlocks;
-  LoadBorrowNeverInvalidatedAnalysis loadBorrowNeverInvalidatedAnalysis;
+  LoadBorrowImmutabilityAnalysis loadBorrowImmutabilityAnalysis;
   bool SingleFunction = true;
 
   SILVerifier(const SILVerifier&) = delete;
@@ -871,7 +863,7 @@ public:
         fnConv(F.getConventionsInContext()), TC(F.getModule().Types),
         OpenedArchetypes(&F), Dominance(nullptr),
         InstNumbers(numInstsInFunction(F)), DEBlocks(&F),
-        loadBorrowNeverInvalidatedAnalysis(DEBlocks),
+        loadBorrowImmutabilityAnalysis(DEBlocks, &F),
         SingleFunction(SingleFunction) {
     if (F.isExternalDeclaration())
       return;
@@ -909,7 +901,7 @@ public:
     return InstNumbers[a] < InstNumbers[b];
   }
 
-  // FIXME: For sanity, address-type block args should be prohibited at all SIL
+  // FIXME: For sanity, address-type phis should be prohibited at all SIL
   // stages. However, the optimizer currently breaks the invariant in three
   // places:
   // 1. Normal Simplify CFG during conditional branch simplification
@@ -917,17 +909,14 @@ public:
   // 2. Simplify CFG via Jump Threading.
   // 3. Loop Rotation.
   //
+  // BasicBlockCloner::canCloneInstruction and sinkAddressProjections is
+  // designed to avoid this issue, we just need to make sure all passes use it
+  // correctly.
   //
-  bool prohibitAddressBlockArgs() {
-    // If this function was deserialized from canonical SIL, this invariant may
-    // already have been violated regardless of this module's SIL stage or
-    // exclusivity enforcement level. Presumably, access markers were already
-    // removed prior to serialization.
-    if (F.wasDeserializedCanonical())
-      return false;
-
-    SILModule &M = F.getModule();
-    return M.getStage() == SILStage::Raw;
+  // Minimally, we must prevent address-type phis as long as access markers are
+  // preserved. A goal is to preserve access markers in OSSA.
+  bool prohibitAddressPhis() {
+    return F.hasOwnership();
   }
 
   void visitSILPhiArgument(SILPhiArgument *arg) {
@@ -943,9 +932,9 @@ public:
       }
     } else {
     }
-    if (arg->isPhiArgument() && prohibitAddressBlockArgs()) {
-      // As a property of well-formed SIL, we disallow address-type block
-      // arguments. Supporting them would prevent reliably reasoning about the
+    if (arg->isPhiArgument() && prohibitAddressPhis()) {
+      // As a property of well-formed SIL, we disallow address-type
+      // phis. Supporting them would prevent reliably reasoning about the
       // underlying storage of memory access. This reasoning is important for
       // diagnosing violations of memory access rules and supporting future
       // optimizations such as bitfield packing. Address-type block arguments
@@ -1029,10 +1018,8 @@ public:
                 "Non-terminators cannot be the last in a block");
       }
     } else {
-      // Skip the check for UnreachableInst, if explicitly asked to do so.
-      if (!isa<UnreachableInst>(I) || !SkipUnreachableMustBeLastErrors)
-        require(&*BB->rbegin() == I,
-                "Terminator must be the last in block");
+      require(&*BB->rbegin() == I,
+              "Terminator must be the last in block");
     }
 
     // Verify that all of our uses are in this function.
@@ -1404,9 +1391,9 @@ public:
       if (isa<SILArgument>(V)) {
         require(hasDynamicSelf,
                 "dynamic self operand without dynamic self type");
-        require(AI->getFunction()->hasSelfMetadataParam(),
+        require(AI->getFunction()->hasDynamicSelfMetadata(),
                 "self metadata operand in function without self metadata param");
-        require((ValueBase *)V == AI->getFunction()->getSelfMetadataArgument(),
+        require((ValueBase *)V == AI->getFunction()->getDynamicSelfMetadata(),
                 "wrong self metadata operand");
       } else {
         require(isa<SingleValueInstruction>(V),
@@ -1751,8 +1738,9 @@ public:
               "[dynamically_replaceable] function");
 
     // In canonical SIL, direct reference to a shared_external declaration
-    // is an error; we should have deserialized a body. In raw SIL, we may
-    // not have deserialized the body yet.
+    // is an error; we should have deserialized a body. In raw SIL, including
+    // the merge-modules phase, we may not have deserialized the body yet as we
+    // may not have run the SILLinker pass.
     if (F.getModule().getStage() >= SILStage::Canonical) {
       if (RefF->isExternalDeclaration()) {
         require(SingleFunction ||
@@ -1893,11 +1881,17 @@ public:
     requireSameType(LBI->getOperand()->getType().getObjectType(),
                     LBI->getType(),
                     "Load operand type and result type mismatch");
-    require(loadBorrowNeverInvalidatedAnalysis.isNeverInvalidated(LBI),
+    require(loadBorrowImmutabilityAnalysis.isImmutable(LBI),
             "Found load borrow that is invalidated by a local write?!");
   }
 
   void checkEndBorrowInst(EndBorrowInst *EBI) {
+    require(
+        F.hasOwnership(),
+        "Inst with qualified ownership in a function that is not qualified");
+  }
+
+  void checkUncheckedValueCastInst(UncheckedValueCastInst *) {
     require(
         F.hasOwnership(),
         "Inst with qualified ownership in a function that is not qualified");
@@ -1932,29 +1926,29 @@ public:
     }
 
     // Verify that all formal accesses patterns are recognized as part of a
-    // whitelist. The presence of an unknown pattern means that analysis will
+    // allowlist. The presence of an unknown pattern means that analysis will
     // silently fail, and the compiler may be introducing undefined behavior
     // with no other way to detect it.
     //
     // For example, AccessEnforcementWMO runs very late in the
     // pipeline and assumes valid storage for all dynamic Read/Modify access. It
-    // also requires that Unidentified access fit a whitelist on known
+    // also requires that Unidentified access fit a allowlist on known
     // non-internal globals or class properties.
     //
-    // First check that findAccessedStorage returns without asserting. For
+    // First check that identifyFormalAccess returns without asserting. For
     // Unsafe enforcement, that is sufficient. For any other enforcement
     // level also require that it returns a valid AccessedStorage object.
     // Unsafe enforcement is used for some unrecognizable access patterns,
     // like debugger variables. The compiler never cares about the source of
     // those accesses.
-    findAccessedStorage(BAI->getSource());
+    identifyFormalAccess(BAI);
     // FIXME: rdar://57291811 - the following check for valid storage will be
     // reenabled shortly. A fix is planned. In the meantime, the possiblity that
     // a real miscompilation could be caused by this failure is insignificant.
     // I will probably enable a much broader SILVerification of address-type
     // block arguments first to ensure we never hit this check again.
     /*
-    AccessedStorage storage = findAccessedStorage(BAI->getSource());
+    AccessedStorage storage = identifyFormalAccess(BAI);
     if (BAI->getEnforcement() != SILAccessEnforcement::Unsafe)
       require(storage, "Unknown formal access pattern");
     */
@@ -1993,8 +1987,8 @@ public:
       break;
     }
 
-    // First check that findAccessedStorage never asserts.
-    AccessedStorage storage = findAccessedStorage(BUAI->getSource());
+    // First check that identifyFormalAccess never asserts.
+    AccessedStorage storage = identifyFormalAccess(BUAI);
     // Only allow Unsafe and Builtin access to have invalid storage.
     if (BUAI->getEnforcement() != SILAccessEnforcement::Unsafe
         && !BUAI->isFromBuiltin()) {
@@ -2753,11 +2747,11 @@ public:
     require(EI->getType().isObject(),
             "result of tuple_extract must be object");
 
-    require(EI->getFieldNo() < operandTy->getNumElements(),
+    require(EI->getFieldIndex() < operandTy->getNumElements(),
             "invalid field index for tuple_extract instruction");
     if (EI->getModule().getStage() != SILStage::Lowered) {
       requireSameType(EI->getType().getASTType(),
-                      operandTy.getElementType(EI->getFieldNo()),
+                      operandTy.getElementType(EI->getFieldIndex()),
                       "type of tuple_extract does not match type of element");
     }
   }
@@ -2799,12 +2793,12 @@ public:
             "must derive tuple_element_addr from tuple");
 
     ArrayRef<TupleTypeElt> fields = operandTy.castTo<TupleType>()->getElements();
-    require(EI->getFieldNo() < fields.size(),
+    require(EI->getFieldIndex() < fields.size(),
             "invalid field index for element_addr instruction");
     if (EI->getModule().getStage() != SILStage::Lowered) {
       requireSameType(
           EI->getType().getASTType(),
-          CanType(fields[EI->getFieldNo()].getType()),
+          CanType(fields[EI->getFieldIndex()].getType()),
           "type of tuple_element_addr does not match type of element");
     }
   }
@@ -2862,7 +2856,7 @@ public:
           loweredFieldTy, EI->getType(),
           "result of ref_element_addr does not match type of field");
     }
-    EI->getFieldNo();  // Make sure we can access the field without crashing.
+    EI->getFieldIndex();  // Make sure we can access the field without crashing.
   }
 
   void checkRefTailAddrInst(RefTailAddrInst *RTAI) {
@@ -3597,6 +3591,15 @@ public:
     verifyOpenedArchetype(CI, CI->getType().getASTType());
   }
 
+  // Make sure that opcodes handled by isRCIdentityPreservingCast cannot cast
+  // from a trivial to a reference type. Such a cast may dynamically
+  // instantiate a new reference-counted object.
+  void checkNoTrivialToReferenceCast(SingleValueInstruction *svi) {
+    require(!svi->getOperand(0)->getType().isTrivial(*svi->getFunction())
+            || svi->getType().isTrivial(*svi->getFunction()),
+            "Unexpected trivial-to-reference conversion: ");
+  }
+
   /// Verify if a given type is or contains an opened archetype or dynamic self.
   /// If this is the case, verify that the provided instruction has a type
   /// dependent operand for it.
@@ -3612,10 +3615,10 @@ public:
         require(Def, "Opened archetype should be registered in SILFunction");
       } else if (t->hasDynamicSelfType()) {
         require(I->getFunction()->hasSelfParam() ||
-                I->getFunction()->hasSelfMetadataParam(),
+                I->getFunction()->hasDynamicSelfMetadata(),
               "Function containing dynamic self type must have self parameter");
-        if (I->getFunction()->hasSelfMetadataParam())
-          Def = I->getFunction()->getArguments().back();
+        if (I->getFunction()->hasDynamicSelfMetadata())
+          Def = I->getFunction()->getDynamicSelfMetadata();
         else
           Def = I->getFunction()->getSelfArgument();
       } else {
@@ -3710,10 +3713,14 @@ public:
 
     auto adjustedOperandExtInfo =
         opFTy->getExtInfo()
+            .intoBuilder()
             .withRepresentation(SILFunctionType::Representation::Thick)
-            .withNoEscape(resFTy->isNoEscape());
-    require(adjustedOperandExtInfo == resFTy->getExtInfo(),
-            "operand and result of thin_to_think_function must agree in particulars");
+            .withNoEscape(resFTy->isNoEscape())
+            .build();
+    require(adjustedOperandExtInfo.isEqualTo(resFTy->getExtInfo(),
+                                             useClangTypes(opFTy)),
+            "operand and result of thin_to_think_function must agree in "
+            "particulars");
   }
 
   void checkThickToObjCMetatypeInst(ThickToObjCMetatypeInst *TTOCI) {
@@ -3755,6 +3762,7 @@ public:
   void checkUpcastInst(UpcastInst *UI) {
     require(UI->getType() != UI->getOperand()->getType(),
             "can't upcast to same type");
+    checkNoTrivialToReferenceCast(UI);
     if (UI->getType().is<MetatypeType>()) {
       CanType instTy(UI->getType().castTo<MetatypeType>()->getInstanceType());
       require(UI->getOperand()->getType().is<MetatypeType>(),
@@ -4722,7 +4730,7 @@ public:
   }
 
   void checkLinearFunctionExtractInst(LinearFunctionExtractInst *lfei) {
-    auto fnTy = lfei->getFunctionOperand()->getType().getAs<SILFunctionType>();
+    auto fnTy = lfei->getOperand()->getType().getAs<SILFunctionType>();
     require(fnTy, "The function operand must have a function type");
     require(fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Linear,
             "The function operand must be a '@differentiable(linear)' "
@@ -4749,6 +4757,72 @@ public:
                     SILType::getPrimitiveObjectType(derivativeFnTy),
                     "Type of witness instruction does not match actual type of "
                     "witnessed function");
+  }
+  
+  void checkGetAsyncContinuationInstBase(GetAsyncContinuationInstBase *GACI) {
+    auto resultTy = GACI->getType();
+    auto &C = resultTy.getASTContext();
+    auto resultBGT = resultTy.getAs<BoundGenericType>();
+    require(resultBGT, "Instruction type must be a continuation type");
+    auto resultDecl = resultBGT->getDecl();
+    require(resultDecl == C.getUnsafeContinuationDecl()
+             || resultDecl == C.getUnsafeThrowingContinuationDecl(),
+            "Instruction type must be a continuation type");
+  }
+  
+  void checkGetAsyncContinuationInst(GetAsyncContinuationInst *GACI) {
+    checkGetAsyncContinuationInstBase(GACI);
+  }
+  
+  void checkGetAsyncContinuationAddrInst(GetAsyncContinuationAddrInst *GACI) {
+    checkGetAsyncContinuationInstBase(GACI);
+
+    requireSameType(GACI->getOperand()->getType(),
+                    GACI->getLoweredResumeType().getAddressType(),
+                    "Operand type must match continuation resume type");
+  }
+  
+  void checkAwaitAsyncContinuationInst(AwaitAsyncContinuationInst *AACI) {
+    // The operand must be a GetAsyncContinuation* instruction.
+    auto cont = dyn_cast<GetAsyncContinuationInstBase>(AACI->getOperand());
+    require(cont, "can only await the result of a get_async_continuation instruction");
+    bool isAddressForm = isa<GetAsyncContinuationAddrInst>(cont);
+
+    auto &C = cont->getType().getASTContext();
+    
+    // The shape of the successors depends on the continuation instruction being
+    // awaited.
+    require((bool)AACI->getErrorBB() == cont->throws(),
+            "must have an error successor if and only if the continuation is throwing");
+    if (cont->throws()) {
+      require(AACI->getErrorBB()->getNumArguments() == 1,
+              "error successor must take one argument");
+      auto arg = AACI->getErrorBB()->getArgument(0);
+      auto errorType = C.getErrorDecl()->getDeclaredType()->getCanonicalType();
+      requireSameType(arg->getType(),
+                      SILType::getPrimitiveObjectType(errorType),
+              "error successor argument must have Error type");
+      
+      if (AACI->getFunction()->hasOwnership()) {
+        require(arg->getOwnershipKind() == ValueOwnershipKind::Owned,
+                "error successor argument must be owned");
+      }
+    }
+    if (isAddressForm) {
+      require(AACI->getResumeBB()->getNumArguments() == 0,
+              "resume successor must take no arguments for get_async_continuation_addr");
+    } else {
+      require(AACI->getResumeBB()->getNumArguments() == 1,
+              "resume successor must take one argument for get_async_continuation");
+      auto arg = AACI->getResumeBB()->getArgument(0);
+
+      requireSameType(arg->getType(), cont->getLoweredResumeType(),
+                      "resume successor must take an argument of the continuation resume type");
+      if (AACI->getFunction()->hasOwnership()) {
+        require(arg->getOwnershipKind() == ValueOwnershipKind::Owned,
+                "resume successor argument must be owned");
+      }
+    }
   }
 
   // This verifies that the entry block of a SIL function doesn't have
@@ -4904,6 +4978,8 @@ public:
       std::set<SILInstruction*> ActiveOps;
 
       CFGState CFG = Normal;
+      
+      GetAsyncContinuationInstBase *GotAsyncContinuation = nullptr;
     };
   };
 
@@ -4911,6 +4987,8 @@ public:
   ///
   /// - stack allocations and deallocations must obey a stack discipline
   /// - accesses must be uniquely ended
+  /// - async continuations must be awaited before getting the continuation again, suspending
+  ///  the task, or exiting the function
   /// - flow-sensitive states must be equivalent on all paths into a block
   void verifyFlowSensitiveRules(SILFunction *F) {
     // Do a traversal of the basic blocks.
@@ -4926,6 +5004,20 @@ public:
       for (SILInstruction &i : *BB) {
         CurInstruction = &i;
 
+        if (i.maySuspend()) {
+          // Instructions that may suspend an async context must not happen
+          // while the continuation is being accessed, with the exception of
+          // the AwaitAsyncContinuationInst that completes suspending the task.
+          if (auto aaci = dyn_cast<AwaitAsyncContinuationInst>(&i)) {
+            require(state.GotAsyncContinuation == aaci->getOperand(),
+                    "encountered await_async_continuation that doesn't match active gotten continuation");
+            state.GotAsyncContinuation = nullptr;
+          } else {
+            require(!state.GotAsyncContinuation,
+                    "cannot suspend async task while unawaited continuation is active");
+          }
+        }
+          
         if (i.isAllocatingStack()) {
           state.Stack.push_back(cast<SingleValueInstruction>(&i));
 
@@ -4948,13 +5040,18 @@ public:
             bool present = state.ActiveOps.erase(beginOp);
             require(present, "operation has already been ended");
           }
-
+        } else if (auto gaci = dyn_cast<GetAsyncContinuationInstBase>(&i)) {
+          require(!state.GotAsyncContinuation,
+                  "get_async_continuation while unawaited continuation is already active");
+          state.GotAsyncContinuation = gaci;
         } else if (auto term = dyn_cast<TermInst>(&i)) {
           if (term->isFunctionExiting()) {
             require(state.Stack.empty(),
                     "return with stack allocs that haven't been deallocated");
             require(state.ActiveOps.empty(),
                     "return with operations still active");
+            require(!state.GotAsyncContinuation,
+                    "return with unawaited async continuation");
 
             if (isa<UnwindInst>(term)) {
               require(state.CFG == VerifyFlowSensitiveRulesDetails::YieldUnwind,
@@ -4972,12 +5069,14 @@ public:
               }
             }
           }
-
+          
           if (isa<YieldInst>(term)) {
             require(state.CFG != VerifyFlowSensitiveRulesDetails::YieldOnceResume,
                     "encountered multiple 'yield's along single path");
             require(state.CFG == VerifyFlowSensitiveRulesDetails::Normal,
                     "encountered 'yield' on abnormal CFG path");
+            require(!state.GotAsyncContinuation,
+                    "encountered 'yield' while an unawaited continuation is active");
           }
 
           auto successors = term->getSuccessors();
@@ -5039,6 +5138,8 @@ public:
                     "inconsistent active-operations sets entering basic block");
             require(state.CFG == foundState.CFG,
                     "inconsistent coroutine states entering basic block");
+            require(state.GotAsyncContinuation == foundState.GotAsyncContinuation,
+                    "inconsistent active async continuations entering basic block");
           }
         }
       }
@@ -5377,6 +5478,10 @@ void SILVTable::verify(const SILModule &M) const {
   for (unsigned i : indices(getEntries())) {
     auto &entry = getEntries()[i];
     
+    // Make sure the module's lookup cache is consistent.
+    assert(entry == *getEntry(const_cast<SILModule &>(M), entry.getMethod())
+           && "vtable entry is out of sync with method's vtable cache");
+    
     // All vtable entries must be decls in a class context.
     assert(entry.getMethod().hasDecl() && "vtable entry is not a decl");
     auto baseInfo = M.Types.getConstantInfo(TypeExpansionContext::minimal(),
@@ -5557,15 +5662,10 @@ void SILModule::verify() const {
   if (!verificationEnabled(*this))
     return;
 
+  checkForLeaks();
+
   // Uniquing set to catch symbol name collisions.
   llvm::DenseSet<StringRef> symbolNames;
-
-  // When merging partial modules, we only link functions from the current
-  // module, without enabling "LinkAll" mode or running the SILLinker pass;
-  // in this case, we need to relax some of the checks.
-  bool SingleFunction = false;
-  if (getOptions().MergePartialModules)
-    SingleFunction = true;
 
   // Check all functions.
   for (const SILFunction &f : *this) {
@@ -5573,7 +5673,7 @@ void SILModule::verify() const {
       llvm::errs() << "Symbol redefined: " << f.getName() << "!\n";
       assert(false && "triggering standard assertion failure routine");
     }
-    f.verify(SingleFunction);
+    f.verify(/*singleFunction*/ false);
   }
 
   // Check all globals.

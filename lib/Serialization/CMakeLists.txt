@@ -1,8 +1,10 @@
+set_swift_llvm_is_available()
 add_swift_host_library(swiftSerialization STATIC
   Deserialization.cpp
   DeserializeSIL.cpp
   ModuleDependencyScanner.cpp
   ModuleFile.cpp
+  ModuleFileSharedCore.cpp
   Serialization.cpp
   SerializedModuleLoader.cpp
   SerializedSILLoader.cpp

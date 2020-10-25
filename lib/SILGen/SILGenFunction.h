@@ -115,6 +115,11 @@ enum class CaptureEmission {
   /// Captures are being emitted for partial application to form a closure
   /// value.
   PartialApplication,
+  /// Captures are being emitted for partial application of a local property
+  /// wrapper setter for assign_by_wrapper. Captures are guaranteed to not
+  /// escape, because assign_by_wrapper will not use the setter if the captured
+  /// variable is not initialized.
+  AssignByWrapper,
 };
 
 /// Different ways in which an l-value can be emitted.
@@ -567,7 +572,7 @@ public:
   Optional<SILAccessEnforcement> getUnknownEnforcement(VarDecl *var = nullptr);
 
   SourceManager &getSourceManager() { return SGM.M.getASTContext().SourceMgr; }
-  std::string getMagicFileString(SourceLoc loc);
+  std::string getMagicFileIDString(SourceLoc loc);
   StringRef getMagicFilePathString(SourceLoc loc);
   StringRef getMagicFunctionString();
 

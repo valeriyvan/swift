@@ -1,6 +1,6 @@
 // RUN: %target-typecheck-verify-swift -swift-version 5
 
-// REQUIRES: OS=macosx || OS=ios || OS=tvos || OS=watchos
+// REQUIRES: VENDOR=apple
 
 // Tests the constantness Sema diagnostics for the OSLogTestHelper module,
 // which acts as a stub for the os overlay.
@@ -27,7 +27,7 @@ func testNonconstantFormatOption(
 
 func testNonconstantPrivacyOption(privacyOpt: OSLogPrivacy) {
   _osLogTestHelper("Integer: \(Int.max, privacy: privacyOpt)")
-    // expected-error@-1 {{argument must be a case of enum 'OSLogPrivacy'}}
+    // expected-error@-1 {{argument must be a static method or property of 'OSLogPrivacy'}}
 }
 
 func testNonconstantAlignmentOption(alignOpt: OSLogStringAlignment) {
@@ -44,7 +44,7 @@ func testMultipleOptions(
     \(2, format: formatOpt, align: .right(columns: 10), privacy: privacyOpt)
     """)
     // expected-error@-2 {{argument must be a static method or property of 'OSLogIntegerFormatting'}}
-    // expected-error@-3 {{argument must be a case of enum 'OSLogPrivacy'}}
+    // expected-error@-3 {{argument must be a static method or property of 'OSLogPrivacy'}}
 }
 
 func testNoninlinedOSLogMessage() {
@@ -155,4 +155,33 @@ func testNonConstantLogObjectLevel(
 
   osLogWithLevel(level, log: log, message)
     // expected-error@-1 {{argument must be a string interpolation}}
+}
+
+// Test that log messages can be wrapped in constant_evaluable functions.
+
+// A function similar to the one used by SwiftUI preview to wrap string
+// literals.
+@_semantics("constant_evaluable")
+public func __designTimeStringStub(
+  _ key: String,
+  fallback: OSLogMessage
+) -> OSLogMessage {
+  fallback
+}
+
+func testSwiftUIPreviewWrapping() {
+  // This should not produce any diagnostics.
+  _osLogTestHelper(__designTimeStringStub("key", fallback: "A literal message"))
+}
+
+public func nonConstantFunction(
+  _ key: String,
+  fallback: OSLogMessage
+) -> OSLogMessage {
+  fallback
+}
+
+func testLogMessageWrappingDiagnostics() {
+  _osLogTestHelper(nonConstantFunction("key", fallback: "A literal message"))
+    // expected-error@-1{{argument must be a string interpolation}}
 }

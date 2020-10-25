@@ -19,6 +19,10 @@ llvm::cl::opt<std::string>
     SILInlineNeverFuns("sil-inline-never-functions", llvm::cl::init(""),
                        llvm::cl::desc("Never inline functions whose name "
                                       "includes this string."));
+llvm::cl::list<std::string>
+    SILInlineNeverFun("sil-inline-never-function", llvm::cl::CommaSeparated,
+                       llvm::cl::desc("Never inline functions whose name "
+                                      "is this string"));
 
 //===----------------------------------------------------------------------===//
 //                               ConstantTracker
@@ -618,14 +622,20 @@ static bool isCallerAndCalleeLayoutConstraintsCompatible(FullApplySite AI) {
     // The generic parameter has a layout constraint.
     // Check that the substitution has the same constraint.
     auto AIReplacement = Type(Param).subst(AISubs);
-    auto AIArchetype = AIReplacement->getAs<ArchetypeType>();
-    if (!AIArchetype)
-      return false;
-    auto AILayout = AIArchetype->getLayoutConstraint();
-    if (!AILayout)
-      return false;
-    if (AILayout != Layout)
-      return false;
+
+    if (Layout->isClass()) {
+      if (!AIReplacement->satisfiesClassConstraint())
+        return false;
+    } else {
+      auto AIArchetype = AIReplacement->getAs<ArchetypeType>();
+      if (!AIArchetype)
+        return false;
+      auto AILayout = AIArchetype->getLayoutConstraint();
+      if (!AILayout)
+        return false;
+      if (AILayout != Layout)
+        return false;
+    }
   }
   return true;
 }
@@ -697,6 +707,13 @@ SILFunction *swift::getEligibleFunction(FullApplySite AI,
       && Callee->getName().find(SILInlineNeverFuns, 0) != StringRef::npos)
     return nullptr;
 
+  if (!SILInlineNeverFun.empty() &&
+      SILInlineNeverFun.end() != std::find(SILInlineNeverFun.begin(),
+                                           SILInlineNeverFun.end(),
+                                           Callee->getName())) {
+    return nullptr;
+  }
+
   if (!Callee->shouldOptimize()) {
     return nullptr;
   }
@@ -709,11 +726,11 @@ SILFunction *swift::getEligibleFunction(FullApplySite AI,
     // Check if passed Self is the same as the Self of the caller.
     // In this case, it is safe to inline because both functions
     // use the same Self.
-    if (!AI.hasSelfArgument() || !Caller->hasSelfMetadataParam()) {
+    if (!AI.hasSelfArgument() || !Caller->hasDynamicSelfMetadata()) {
       return nullptr;
     }
     auto CalleeSelf = stripCasts(AI.getSelfArgument());
-    auto CallerSelf = Caller->getSelfMetadataArgument();
+    auto CallerSelf = Caller->getDynamicSelfMetadata();
     if (CalleeSelf != SILValue(CallerSelf)) {
       return nullptr;
     }

@@ -123,6 +123,7 @@ SHOULD_NEVER_VISIT_INST(DynamicFunctionRef)
 SHOULD_NEVER_VISIT_INST(PreviousDynamicFunctionRef)
 SHOULD_NEVER_VISIT_INST(GlobalAddr)
 SHOULD_NEVER_VISIT_INST(GlobalValue)
+SHOULD_NEVER_VISIT_INST(BaseAddrForOffset)
 SHOULD_NEVER_VISIT_INST(IntegerLiteral)
 SHOULD_NEVER_VISIT_INST(Metatype)
 SHOULD_NEVER_VISIT_INST(ObjCProtocol)
@@ -135,6 +136,8 @@ SHOULD_NEVER_VISIT_INST(Unwind)
 SHOULD_NEVER_VISIT_INST(ReleaseValue)
 SHOULD_NEVER_VISIT_INST(ReleaseValueAddr)
 SHOULD_NEVER_VISIT_INST(StrongRelease)
+SHOULD_NEVER_VISIT_INST(GetAsyncContinuation)
+
 #define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)            \
   SHOULD_NEVER_VISIT_INST(StrongRetain##Name)                                  \
   SHOULD_NEVER_VISIT_INST(Name##Retain)
@@ -173,6 +176,7 @@ CONSTANT_OWNERSHIP_INST(Owned, MustBeInvalidated, DestroyValue)
 CONSTANT_OWNERSHIP_INST(Owned, MustBeInvalidated, EndLifetime)
 CONSTANT_OWNERSHIP_INST(Owned, MustBeInvalidated, BeginCOWMutation)
 CONSTANT_OWNERSHIP_INST(Owned, MustBeInvalidated, EndCOWMutation)
+CONSTANT_OWNERSHIP_INST(Owned, MustBeLive, AwaitAsyncContinuation)
 CONSTANT_OWNERSHIP_INST(None, MustBeLive, AbortApply)
 CONSTANT_OWNERSHIP_INST(None, MustBeLive, AddressToPointer)
 CONSTANT_OWNERSHIP_INST(None, MustBeLive, BeginAccess)
@@ -188,6 +192,7 @@ CONSTANT_OWNERSHIP_INST(None, MustBeLive, DestroyAddr)
 CONSTANT_OWNERSHIP_INST(None, MustBeLive, EndAccess)
 CONSTANT_OWNERSHIP_INST(None, MustBeLive, EndApply)
 CONSTANT_OWNERSHIP_INST(None, MustBeLive, EndUnpairedAccess)
+CONSTANT_OWNERSHIP_INST(None, MustBeLive, GetAsyncContinuationAddr)
 CONSTANT_OWNERSHIP_INST(None, MustBeLive, IndexAddr)
 CONSTANT_OWNERSHIP_INST(None, MustBeLive, IndexRawPointer)
 CONSTANT_OWNERSHIP_INST(None, MustBeLive, InitBlockStorageHeader)
@@ -349,6 +354,7 @@ FORWARD_ANY_OWNERSHIP_INST(DestructureTuple)
 FORWARD_ANY_OWNERSHIP_INST(InitExistentialRef)
 FORWARD_ANY_OWNERSHIP_INST(DifferentiableFunction)
 FORWARD_ANY_OWNERSHIP_INST(LinearFunction)
+FORWARD_ANY_OWNERSHIP_INST(UncheckedValueCast)
 #undef FORWARD_ANY_OWNERSHIP_INST
 
 // An instruction that forwards a constant ownership or trivial ownership.
@@ -1011,6 +1017,7 @@ ANY_OWNERSHIP_BUILTIN(Swift3ImplicitObjCEntrypoint)
 ANY_OWNERSHIP_BUILTIN(PoundAssert)
 ANY_OWNERSHIP_BUILTIN(GlobalStringTablePointer)
 ANY_OWNERSHIP_BUILTIN(TypePtrAuthDiscriminator)
+ANY_OWNERSHIP_BUILTIN(IntInstrprofIncrement)
 #undef ANY_OWNERSHIP_BUILTIN
 
 // This is correct today since we do not have any builtins which return

@@ -16,7 +16,6 @@
 
 #include "CodeSynthesis.h"
 
-#include "ConstraintSystem.h"
 #include "TypeChecker.h"
 #include "TypeCheckDecl.h"
 #include "TypeCheckObjC.h"
@@ -33,6 +32,7 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Defer.h"
 #include "swift/ClangImporter/ClangModule.h"
+#include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 using namespace swift;
@@ -253,10 +253,25 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
         // type.
         if (var->isPropertyMemberwiseInitializedWithWrappedType()) {
           varInterfaceType = var->getPropertyWrapperInitValueInterfaceType();
-          isAutoClosure =
-            var->isInnermostPropertyWrapperInitUsesEscapingAutoClosure();
+
+          auto wrapperInfo = var->getPropertyWrapperBackingPropertyInfo();
+          isAutoClosure = wrapperInfo.wrappedValuePlaceholder->isAutoClosure();
         } else {
           varInterfaceType = backingPropertyType;
+        }
+      }
+
+      Type resultBuilderType= var->getResultBuilderType();
+      if (resultBuilderType) {
+        // If the variable's type is structurally a function type, use that
+        // type. Otherwise, form a non-escaping function type for the function
+        // parameter.
+        bool isStructuralFunctionType =
+            varInterfaceType->lookThroughAllOptionalTypes()
+              ->is<AnyFunctionType>();
+        if (!isStructuralFunctionType) {
+          auto extInfo = ASTExtInfoBuilder().withNoEscape().build();
+          varInterfaceType = FunctionType::get({ }, varInterfaceType, extInfo);
         }
       }
 
@@ -271,6 +286,14 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
 
       // Don't allow the parameter to accept temporary pointer conversions.
       arg->setNonEphemeralIfPossible();
+
+      // Attach a result builder attribute if needed.
+      if (resultBuilderType) {
+        auto typeExpr = TypeExpr::createImplicit(resultBuilderType, ctx);
+        auto attr = CustomAttr::create(
+            ctx, SourceLoc(), typeExpr, /*implicit=*/true);
+        arg->getAttrs().add(attr);
+      }
 
       maybeAddMemberwiseDefaultArg(arg, var, params.size(), ctx);
       
@@ -322,11 +345,11 @@ synthesizeStubBody(AbstractFunctionDecl *fn, void *) {
   }
 
   auto *staticStringDecl = ctx.getStaticStringDecl();
-  auto staticStringType = staticStringDecl->getDeclaredType();
+  auto staticStringType = staticStringDecl->getDeclaredInterfaceType();
   auto staticStringInit = ctx.getStringBuiltinInitDecl(staticStringDecl);
 
   auto *uintDecl = ctx.getUIntDecl();
-  auto uintType = uintDecl->getDeclaredType();
+  auto uintType = uintDecl->getDeclaredInterfaceType();
   auto uintInit = ctx.getIntBuiltinInitDecl(uintDecl);
 
   // Create a call to Swift._unimplementedInitializer
@@ -355,7 +378,7 @@ synthesizeStubBody(AbstractFunctionDecl *fn, void *) {
   initName->setBuiltinInitializer(staticStringInit);
 
   auto *file = new (ctx) MagicIdentifierLiteralExpr(
-    MagicIdentifierLiteralExpr::File, loc, /*Implicit=*/true);
+    MagicIdentifierLiteralExpr::FileID, loc, /*Implicit=*/true);
   file->setType(staticStringType);
   file->setBuiltinInitializer(staticStringInit);
 
@@ -549,10 +572,11 @@ configureInheritedDesignatedInitAttributes(ClassDecl *classDecl,
 
   // If the superclass constructor is @objc but the subclass constructor is
   // not representable in Objective-C, add @nonobjc implicitly.
+  Optional<ForeignAsyncConvention> asyncConvention;
   Optional<ForeignErrorConvention> errorConvention;
   if (superclassCtor->isObjC() &&
       !isRepresentableInObjC(ctor, ObjCReason::MemberOfObjCSubclass,
-                             errorConvention))
+                             asyncConvention, errorConvention))
     ctor->getAttrs().add(new (ctx) NonObjCAttr(/*isImplicit=*/true));
 }
 
@@ -910,8 +934,8 @@ static bool canInheritDesignatedInits(Evaluator &eval, ClassDecl *decl) {
 
 static void collectNonOveriddenSuperclassInits(
     ClassDecl *subclass, SmallVectorImpl<ConstructorDecl *> &results) {
-  auto superclassTy = subclass->getSuperclass();
-  assert(superclassTy);
+  auto *superclassDecl = subclass->getSuperclassDecl();
+  assert(superclassDecl);
 
   // Record all of the initializers the subclass has overriden, excluding stub
   // overrides, which we don't want to consider as viable delegates for
@@ -923,11 +947,17 @@ static void collectNonOveriddenSuperclassInits(
         if (auto overridden = ctor->getOverriddenDecl())
           overriddenInits.insert(overridden);
 
-  auto superclassCtors = TypeChecker::lookupConstructors(
-      subclass, superclassTy, NameLookupFlags::IgnoreAccessControl);
+  superclassDecl->synthesizeSemanticMembersIfNeeded(
+    DeclBaseName::createConstructor());
 
-  for (auto memberResult : superclassCtors) {
-    auto superclassCtor = cast<ConstructorDecl>(memberResult.getValueDecl());
+  NLOptions subOptions = (NL_QualifiedDefault | NL_IgnoreAccessControl);
+  SmallVector<ValueDecl *, 4> lookupResults;
+  subclass->lookupQualified(
+      superclassDecl, DeclNameRef::createConstructor(),
+      subOptions, lookupResults);
+
+  for (auto decl : lookupResults) {
+    auto superclassCtor = cast<ConstructorDecl>(decl);
 
     // Skip invalid superclass initializers.
     if (superclassCtor->isInvalid())
@@ -957,12 +987,7 @@ static void addImplicitInheritedConstructorsToClass(ClassDecl *decl) {
   decl->setAddedImplicitInitializers();
 
   // We can only inherit initializers if we have a superclass.
-  // FIXME: We should be bailing out earlier in the function, but unfortunately
-  // that currently regresses associated type inference for cases like
-  // compiler_crashers_2_fixed/0124-sr5825.swift due to the fact that we no
-  // longer eagerly compute the interface types of the other constructors.
-  auto superclassTy = decl->getSuperclass();
-  if (!superclassTy)
+  if (!decl->getSuperclassDecl() || !decl->getSuperclass())
     return;
 
   // Check whether the user has defined a designated initializer for this class,
@@ -1051,12 +1076,11 @@ InheritsSuperclassInitializersRequest::evaluate(Evaluator &eval,
   if (decl->getAttrs().hasAttribute<InheritsConvenienceInitializersAttr>())
     return true;
 
-  auto superclass = decl->getSuperclass();
-  assert(superclass);
+  auto superclassDecl = decl->getSuperclassDecl();
+  assert(superclassDecl);
 
   // If the superclass has known-missing designated initializers, inheriting
   // is unsafe.
-  auto *superclassDecl = superclass->getClassOrBoundGenericClass();
   if (superclassDecl->getModuleContext() != decl->getParentModule() &&
       superclassDecl->hasMissingDesignatedInitializers())
     return false;
@@ -1332,7 +1356,7 @@ HasDefaultInitRequest::evaluate(Evaluator &evaluator,
   // Don't synthesize a default for a subclass, it will attempt to inherit its
   // initializers from its superclass.
   if (auto *cd = dyn_cast<ClassDecl>(decl))
-    if (cd->getSuperclass())
+    if (cd->getSuperclassDecl())
       return false;
 
   // If the user has already defined a designated initializer, then don't
@@ -1413,23 +1437,4 @@ void swift::addFixedLayoutAttr(NominalTypeDecl *nominal) {
   }
   // Add `@_fixed_layout` to the nominal.
   nominal->getAttrs().add(new (C) FixedLayoutAttr(/*Implicit*/ true));
-}
-
-Expr *DiscriminatorFinder::walkToExprPost(Expr *E) {
-  auto *ACE = dyn_cast<AbstractClosureExpr>(E);
-  if (!ACE)
-    return E;
-
-  unsigned Discriminator = ACE->getDiscriminator();
-  assert(Discriminator != AbstractClosureExpr::InvalidDiscriminator &&
-         "Existing closures should have valid discriminators");
-  if (Discriminator >= NextDiscriminator)
-    NextDiscriminator = Discriminator + 1;
-  return E;
-}
-
-unsigned DiscriminatorFinder::getNextDiscriminator() {
-  if (NextDiscriminator == AbstractClosureExpr::InvalidDiscriminator)
-    llvm::report_fatal_error("Out of valid closure discriminators");
-  return NextDiscriminator++;
 }

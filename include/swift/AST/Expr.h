@@ -249,17 +249,8 @@ protected:
     NumArgLabels : 16
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(UnresolvedMemberExpr, Expr, 1+1+1+16,
-    /// Whether the UnresolvedMemberExpr has arguments.
-    HasArguments : 1,
-    /// Whether the UnresolvedMemberExpr also has source locations for the
-    /// argument label.
-    HasArgLabelLocs : 1,
-    /// Whether the last argument is a trailing closure.
-    HasTrailingClosure : 1,
-    : NumPadBits,
-    /// # of argument labels stored after the UnresolvedMemberExpr.
-    NumArgLabels : 16
+  SWIFT_INLINE_BITFIELD_FULL(UnresolvedMemberExpr, Expr, 2,
+    FunctionRefKind : 2
   );
 
   SWIFT_INLINE_BITFIELD(OverloadSetRefExpr, Expr, 2,
@@ -622,6 +613,9 @@ public:
 
 /// LiteralExpr - Common base class between the literals.
 class LiteralExpr : public Expr {
+  // Set by Sema:
+  ConcreteDeclRef Initializer;
+
 public:
   LiteralExpr(ExprKind Kind, bool Implicit) : Expr(Kind, Implicit) {}
 
@@ -629,13 +623,55 @@ public:
     return E->getKind() >= ExprKind::First_LiteralExpr &&
            E->getKind() <= ExprKind::Last_LiteralExpr;
   }
+
+  /// Retrieve the initializer that will be used to construct the
+  /// literal from the result of the initializer.
+  ///
+  /// Only literals that have no builtin literal conformance will have
+  /// this initializer, which will be called on the result of the builtin
+  /// initializer.
+  ConcreteDeclRef getInitializer() const { return Initializer; }
+
+  /// Set the initializer that will be used to construct the literal.
+  void setInitializer(ConcreteDeclRef initializer) {
+    Initializer = initializer;
+  }
+};
+
+/// BuiltinLiteralExpr - Common base class between all literals
+/// that provides BuiltinInitializer
+class BuiltinLiteralExpr : public LiteralExpr {
+  // Set by Seam:
+  ConcreteDeclRef BuiltinInitializer;
+
+public:
+  BuiltinLiteralExpr(ExprKind Kind, bool Implicit)
+      : LiteralExpr(Kind, Implicit) {}
+
+  static bool classof(const Expr *E) {
+    return E->getKind() >= ExprKind::First_BuiltinLiteralExpr &&
+           E->getKind() <= ExprKind::Last_BuiltinLiteralExpr;
+  }
+
+  /// Retrieve the builtin initializer that will be used to construct the
+  /// literal.
+  ///
+  /// Any type-checked literal will have a builtin initializer, which is
+  /// called first to form a concrete Swift type.
+  ConcreteDeclRef getBuiltinInitializer() const { return BuiltinInitializer; }
+
+  /// Set the builtin initializer that will be used to construct the
+  /// literal.
+  void setBuiltinInitializer(ConcreteDeclRef builtinInitializer) {
+    BuiltinInitializer = builtinInitializer;
+  }
 };
 
 /// The 'nil' literal.
 ///
 class NilLiteralExpr : public LiteralExpr {
   SourceLoc Loc;
-  ConcreteDeclRef Initializer;
+
 public:
   NilLiteralExpr(SourceLoc Loc, bool Implicit = false)
   : LiteralExpr(ExprKind::NilLiteral, Implicit), Loc(Loc) {
@@ -644,15 +680,6 @@ public:
   SourceRange getSourceRange() const {
     return Loc;
   }
-
-  /// Retrieve the initializer that will be used to construct the 'nil'
-  /// literal from the result of the initializer.
-  ConcreteDeclRef getInitializer() const { return Initializer; }
-
-  /// Set the initializer that will be used to construct the 'nil' literal.
-  void setInitializer(ConcreteDeclRef initializer) {
-    Initializer = initializer;
-  }
   
   static bool classof(const Expr *E) {
     return E->getKind() == ExprKind::NilLiteral;
@@ -660,26 +687,23 @@ public:
 };
 
 /// Abstract base class for numeric literals, potentially with a sign.
-class NumberLiteralExpr : public LiteralExpr {
+class NumberLiteralExpr : public BuiltinLiteralExpr {
   /// The value of the literal as an ASTContext-owned string. Underscores must
   /// be stripped.
   StringRef Val;  // Use StringRef instead of APInt or APFloat, which leak.
-  ConcreteDeclRef BuiltinInitializer;
-  ConcreteDeclRef Initializer;
 
 protected:
   SourceLoc MinusLoc;
   SourceLoc DigitsLoc;
   
 public:
-   NumberLiteralExpr(ExprKind Kind,
-                     StringRef Val, SourceLoc DigitsLoc, bool Implicit)
-       : LiteralExpr(Kind, Implicit), Val(Val), DigitsLoc(DigitsLoc)
-   {
-     Bits.NumberLiteralExpr.IsNegative = false;
-     Bits.NumberLiteralExpr.IsExplicitConversion = false;
-   }
-  
+  NumberLiteralExpr(ExprKind Kind, StringRef Val, SourceLoc DigitsLoc,
+                    bool Implicit)
+      : BuiltinLiteralExpr(Kind, Implicit), Val(Val), DigitsLoc(DigitsLoc) {
+    Bits.NumberLiteralExpr.IsNegative = false;
+    Bits.NumberLiteralExpr.IsExplicitConversion = false;
+  }
+
   bool isNegative() const { return Bits.NumberLiteralExpr.IsNegative; }
   void setNegative(SourceLoc Loc) {
     MinusLoc = Loc;
@@ -708,32 +732,6 @@ public:
 
   SourceLoc getDigitsLoc() const {
     return DigitsLoc;
-  }
-
-  /// Retrieve the builtin initializer that will be used to construct the
-  /// boolean literal.
-  ///
-  /// Any type-checked boolean literal will have a builtin initializer, which is
-  /// called first to form a concrete Swift type.
-  ConcreteDeclRef getBuiltinInitializer() const { return BuiltinInitializer; }
-
-  /// Set the builtin initializer that will be used to construct the boolean
-  /// literal.
-  void setBuiltinInitializer(ConcreteDeclRef builtinInitializer) {
-    BuiltinInitializer = builtinInitializer;
-  }
-
-  /// Retrieve the initializer that will be used to construct the boolean
-  /// literal from the result of the initializer.
-  ///
-  /// Only boolean literals that have no builtin literal conformance will have
-  /// this initializer, which will be called on the result of the builtin
-  /// initializer.
-  ConcreteDeclRef getInitializer() const { return Initializer; }
-
-  /// Set the initializer that will be used to construct the boolean literal.
-  void setInitializer(ConcreteDeclRef initializer) {
-    Initializer = initializer;
   }
 
   static bool classof(const Expr *E) {
@@ -799,14 +797,12 @@ public:
 
 /// A Boolean literal ('true' or 'false')
 ///
-class BooleanLiteralExpr : public LiteralExpr {
+class BooleanLiteralExpr : public BuiltinLiteralExpr {
   SourceLoc Loc;
-  ConcreteDeclRef BuiltinInitializer;
-  ConcreteDeclRef Initializer;
 
 public:
   BooleanLiteralExpr(bool Value, SourceLoc Loc, bool Implicit = false)
-    : LiteralExpr(ExprKind::BooleanLiteral, Implicit), Loc(Loc) {
+      : BuiltinLiteralExpr(ExprKind::BooleanLiteral, Implicit), Loc(Loc) {
     Bits.BooleanLiteralExpr.Value = Value;
   }
 
@@ -817,52 +813,21 @@ public:
     return Loc;
   }
 
-  /// Retrieve the builtin initializer that will be used to construct the
-  /// boolean literal.
-  ///
-  /// Any type-checked boolean literal will have a builtin initializer, which is
-  /// called first to form a concrete Swift type.
-  ConcreteDeclRef getBuiltinInitializer() const { return BuiltinInitializer; }
-
-  /// Set the builtin initializer that will be used to construct the boolean
-  /// literal.
-  void setBuiltinInitializer(ConcreteDeclRef builtinInitializer) {
-    BuiltinInitializer = builtinInitializer;
-  }
-
-  /// Retrieve the initializer that will be used to construct the boolean
-  /// literal from the result of the initializer.
-  ///
-  /// Only boolean literals that have no builtin literal conformance will have
-  /// this initializer, which will be called on the result of the builtin
-  /// initializer.
-  ConcreteDeclRef getInitializer() const { return Initializer; }
-
-  /// Set the initializer that will be used to construct the boolean literal.
-  void setInitializer(ConcreteDeclRef initializer) {
-    Initializer = initializer;
-  }
-
   static bool classof(const Expr *E) {
     return E->getKind() == ExprKind::BooleanLiteral;
   }
 };
-  
+
 /// StringLiteralExpr - String literal, like '"foo"'.
-class StringLiteralExpr : public LiteralExpr {
+class StringLiteralExpr : public BuiltinLiteralExpr {
   StringRef Val;
   SourceRange Range;
-  ConcreteDeclRef BuiltinInitializer;
-  ConcreteDeclRef Initializer;
 
 public:
   /// The encoding that should be used for the string literal.
   enum Encoding : unsigned {
     /// A UTF-8 string.
     UTF8,
-
-    /// A UTF-16 string.
-    UTF16,
 
     /// A single UnicodeScalar, passed as an integer.
     OneUnicodeScalar
@@ -889,32 +854,6 @@ public:
 
   bool isSingleExtendedGraphemeCluster() const {
     return Bits.StringLiteralExpr.IsSingleExtendedGraphemeCluster;
-  }
-
-  /// Retrieve the builtin initializer that will be used to construct the string
-  /// literal.
-  ///
-  /// Any type-checked string literal will have a builtin initializer, which is
-  /// called first to form a concrete Swift type.
-  ConcreteDeclRef getBuiltinInitializer() const { return BuiltinInitializer; }
-
-  /// Set the builtin initializer that will be used to construct the string
-  /// literal.
-  void setBuiltinInitializer(ConcreteDeclRef builtinInitializer) {
-    BuiltinInitializer = builtinInitializer;
-  }
-
-  /// Retrieve the initializer that will be used to construct the string
-  /// literal from the result of the initializer.
-  ///
-  /// Only string literals that have no builtin literal conformance will have
-  /// this initializer, which will be called on the result of the builtin
-  /// initializer.
-  ConcreteDeclRef getInitializer() const { return Initializer; }
-
-  /// Set the initializer that will be used to construct the string literal.
-  void setInitializer(ConcreteDeclRef initializer) {
-    Initializer = initializer;
   }
 
   static bool classof(const Expr *E) {
@@ -985,7 +924,6 @@ class InterpolatedStringLiteralExpr : public LiteralExpr {
   // Set by Sema:
   OpaqueValueExpr *interpolationExpr = nullptr;
   ConcreteDeclRef builderInit;
-  ConcreteDeclRef resultInit;
   Expr *interpolationCountExpr = nullptr;
   Expr *literalCapacityExpr = nullptr;
 
@@ -1006,11 +944,6 @@ public:
   // Sets the constructor for the interpolation type.
   void setBuilderInit(ConcreteDeclRef decl) { builderInit = decl; }
   ConcreteDeclRef getBuilderInit() const { return builderInit; }
-
-  /// Sets the decl that constructs the final result type after the
-  /// AppendingExpr has been evaluated.
-  void setResultInit(ConcreteDeclRef decl) { resultInit = decl; }
-  ConcreteDeclRef getResultInit() const { return resultInit; }
 
   /// Sets the OpaqueValueExpr that is passed into AppendingExpr as the SubExpr
   /// that the tap operates on.
@@ -1071,20 +1004,17 @@ public:
   
 /// MagicIdentifierLiteralExpr - A magic identifier like #file which expands
 /// out to a literal at SILGen time.
-class MagicIdentifierLiteralExpr : public LiteralExpr {
+class MagicIdentifierLiteralExpr : public BuiltinLiteralExpr {
 public:
   enum Kind : unsigned {
-    File, FilePath, Line, Column, Function, DSOHandle
+#define MAGIC_IDENTIFIER(NAME, STRING, SYNTAX_KIND) NAME,
+#include "swift/AST/MagicIdentifierKinds.def"
   };
 
   static StringRef getKindString(MagicIdentifierLiteralExpr::Kind value) {
     switch (value) {
-      case File: return "#file";
-      case FilePath: return "#filePath";
-      case Function: return "#function";
-      case Line: return "#line";
-      case Column: return "#column";
-      case DSOHandle: return "#dsohandle";
+#define MAGIC_IDENTIFIER(NAME, STRING, SYNTAX_KIND) case NAME: return STRING;
+#include "swift/AST/MagicIdentifierKinds.def"
     }
 
     llvm_unreachable("Unhandled MagicIdentifierLiteralExpr in getKindString.");
@@ -1092,36 +1022,29 @@ public:
 
 private:
   SourceLoc Loc;
-  ConcreteDeclRef BuiltinInitializer;
-  ConcreteDeclRef Initializer;
 
 public:
   MagicIdentifierLiteralExpr(Kind kind, SourceLoc loc, bool implicit = false)
-    : LiteralExpr(ExprKind::MagicIdentifierLiteral, implicit), Loc(loc) {
+      : BuiltinLiteralExpr(ExprKind::MagicIdentifierLiteral, implicit),
+        Loc(loc) {
     Bits.MagicIdentifierLiteralExpr.Kind = static_cast<unsigned>(kind);
     Bits.MagicIdentifierLiteralExpr.StringEncoding
       = static_cast<unsigned>(StringLiteralExpr::UTF8);
   }
-  
+
   Kind getKind() const {
     return static_cast<Kind>(Bits.MagicIdentifierLiteralExpr.Kind);
   }
 
-  bool isFile() const { return getKind() == File; }
-  bool isFunction() const { return getKind() == Function; }
-  bool isLine() const { return getKind() == Line; }
-  bool isColumn() const { return getKind() == Column; }
-  
   bool isString() const {
     switch (getKind()) {
-    case File:
-    case FilePath:
-    case Function:
+#define MAGIC_STRING_IDENTIFIER(NAME, STRING, SYNTAX_KIND) \
+    case NAME: \
       return true;
-    case Line:
-    case Column:
-    case DSOHandle:
+#define MAGIC_IDENTIFIER(NAME, STRING, SYNTAX_KIND) \
+    case NAME: \
       return false;
+#include "swift/AST/MagicIdentifierKinds.def"
     }
     llvm_unreachable("bad Kind");
   }
@@ -1142,35 +1065,6 @@ public:
     assert(isString() && "Magic identifier literal has non-string encoding");
     Bits.MagicIdentifierLiteralExpr.StringEncoding
       = static_cast<unsigned>(encoding);
-  }
-
-  /// Retrieve the builtin initializer that will be used to construct the
-  /// literal.
-  ///
-  /// Any type-checked literal will have a builtin initializer, which is
-  /// called first to form a concrete Swift type.
-  ConcreteDeclRef getBuiltinInitializer() const {
-    return BuiltinInitializer;
-  }
-
-  /// Set the builtin initializer that will be used to construct the literal.
-  void setBuiltinInitializer(ConcreteDeclRef builtinInitializer) {
-    BuiltinInitializer = builtinInitializer;
-  }
-
-  /// Retrieve the initializer that will be used to construct the literal from
-  /// the result of the initializer.
-  ///
-  /// Only literals that have no builtin literal conformance will have
-  /// this initializer, which will be called on the result of the builtin
-  /// initializer.
-  ConcreteDeclRef getInitializer() const {
-    return Initializer;
-  }
-
-  /// Set the initializer that will be used to construct the literal.
-  void setInitializer(ConcreteDeclRef initializer) {
-    Initializer = initializer;
   }
 
   static bool classof(const Expr *E) {
@@ -1195,7 +1089,6 @@ public:
 private:
   Expr *Arg;
   SourceLoc PoundLoc;
-  ConcreteDeclRef Initializer;
 
   ObjectLiteralExpr(SourceLoc PoundLoc, LiteralKind LitKind,
                     Expr *Arg,
@@ -1257,15 +1150,6 @@ public:
   StringRef getLiteralKindRawName() const;
 
   StringRef getLiteralKindPlainName() const;
-
-  /// Retrieve the initializer that will be used to construct the 'object'
-  /// literal from the result of the initializer.
-  ConcreteDeclRef getInitializer() const { return Initializer; }
-
-  /// Set the initializer that will be used to construct the 'object' literal.
-  void setInitializer(ConcreteDeclRef initializer) {
-    Initializer = initializer;
-  }
 
   static bool classof(const Expr *E) {
     return E->getKind() == ExprKind::ObjectLiteral;
@@ -1353,6 +1237,7 @@ public:
     : Expr(ExprKind::SuperRef, Implicit, SuperTy), Self(Self), Loc(Loc) {}
   
   VarDecl *getSelf() const { return Self; }
+  void setSelf(VarDecl *self) { Self = self; }
   
   SourceLoc getSuperLoc() const { return Loc; }
   SourceRange getSourceRange() const { return Loc; }
@@ -1853,71 +1738,49 @@ public:
 /// member, which is to be resolved with context sensitive type information into
 /// bar.foo.  These always have unresolved type.
 class UnresolvedMemberExpr final
-    : public Expr,
-      public TrailingCallArguments<UnresolvedMemberExpr> {
+    : public Expr {
   SourceLoc DotLoc;
   DeclNameLoc NameLoc;
   DeclNameRef Name;
-  Expr *Argument;
-
-  UnresolvedMemberExpr(SourceLoc dotLoc, DeclNameLoc nameLoc,
-                       DeclNameRef name, Expr *argument,
-                       ArrayRef<Identifier> argLabels,
-                       ArrayRef<SourceLoc> argLabelLocs,
-                       bool hasTrailingClosure,
-                       bool implicit);
 
 public:
-  /// Create a new unresolved member expression with no arguments.
-  static UnresolvedMemberExpr *create(ASTContext &ctx, SourceLoc dotLoc,
-                                      DeclNameLoc nameLoc, DeclNameRef name,
-                                      bool implicit);
-
-  /// Create a new unresolved member expression.
-  static UnresolvedMemberExpr *create(ASTContext &ctx, SourceLoc dotLoc,
-                                      DeclNameLoc nameLoc, DeclNameRef name,
-                                      SourceLoc lParenLoc,
-                                      ArrayRef<Expr *> args,
-                                      ArrayRef<Identifier> argLabels,
-                                      ArrayRef<SourceLoc> argLabelLocs,
-                                      SourceLoc rParenLoc,
-                                      ArrayRef<TrailingClosure> trailingClosures,
-                                      bool implicit);
+  UnresolvedMemberExpr(SourceLoc dotLoc, DeclNameLoc nameLoc, DeclNameRef name,
+                       bool implicit)
+    : Expr(ExprKind::UnresolvedMember, implicit), DotLoc(dotLoc),
+      NameLoc(nameLoc), Name(name) {
+    // FIXME: Really, we should be setting this to `FunctionRefKind::Compound`
+    // if `NameLoc` is compound, but this would be a source break for cases like
+    // ```
+    // struct S {
+    //   static func makeS(_: Int) -> S! { S() }
+    // }
+    //
+    // let s: S = .makeS(_:)(0)
+    // ```
+    // Instead, we should store compound-ness as a separate bit from applied/
+    // unapplied.
+    Bits.UnresolvedMemberExpr.FunctionRefKind =
+        static_cast<unsigned>(FunctionRefKind::Unapplied);
+  }
 
   DeclNameRef getName() const { return Name; }
   DeclNameLoc getNameLoc() const { return NameLoc; }
   SourceLoc getDotLoc() const { return DotLoc; }
-  Expr *getArgument() const { return Argument; }
-  void setArgument(Expr *argument) { Argument = argument; }
-
-  /// Whether this reference has arguments.
-  bool hasArguments() const {
-    return Bits.UnresolvedMemberExpr.HasArguments;
-  }
-
-  unsigned getNumArguments() const {
-    return Bits.UnresolvedMemberExpr.NumArgLabels;
-  }
-
-  bool hasArgumentLabelLocs() const {
-    return Bits.UnresolvedMemberExpr.HasArgLabelLocs;
-  }
-
-  /// Whether this call with written with a trailing closure.
-  bool hasTrailingClosure() const {
-    return Bits.UnresolvedMemberExpr.HasTrailingClosure;
-  }
-
-  /// Return the index of the unlabeled trailing closure argument.
-  Optional<unsigned> getUnlabeledTrailingClosureIndex() const {
-    return getArgument()->getUnlabeledTrailingClosureIndexOfPackedArgument();
-  }
 
   SourceLoc getLoc() const { return NameLoc.getBaseNameLoc(); }
 
   SourceLoc getStartLoc() const { return DotLoc; }
-  SourceLoc getEndLoc() const {
-    return (Argument ? Argument->getEndLoc() : NameLoc.getSourceRange().End);
+  SourceLoc getEndLoc() const { return NameLoc.getSourceRange().End; }
+
+  /// Retrieve the kind of function reference.
+  FunctionRefKind getFunctionRefKind() const {
+    return static_cast<FunctionRefKind>(
+        Bits.UnresolvedMemberExpr.FunctionRefKind);
+  }
+
+  /// Set the kind of function reference.
+  void setFunctionRefKind(FunctionRefKind refKind) {
+    Bits.UnresolvedMemberExpr.FunctionRefKind = static_cast<unsigned>(refKind);
   }
   
   static bool classof(const Expr *E) {
@@ -1973,7 +1836,7 @@ public:
 /// ForceTryExpr - A 'try!' surrounding an expression, marking that
 /// the expression contains code which might throw, but that the code
 /// should dynamically assert if it does.
-class ForceTryExpr : public AnyTryExpr {
+class ForceTryExpr final : public AnyTryExpr {
   SourceLoc ExclaimLoc;
 
 public:
@@ -1992,7 +1855,7 @@ public:
 /// A 'try?' surrounding an expression, marking that the expression contains
 /// code which might throw, and that the result should be injected into an
 /// Optional. If the code does throw, \c nil is produced.
-class OptionalTryExpr : public AnyTryExpr {
+class OptionalTryExpr final : public AnyTryExpr {
   SourceLoc QuestionLoc;
 
 public:
@@ -2011,7 +1874,6 @@ public:
 /// An expression node that does not affect the evaluation of its subexpression.
 class IdentityExpr : public Expr {
   Expr *SubExpr;
-  
 public:
   IdentityExpr(ExprKind kind,
                Expr *subExpr, Type ty = Type(),
@@ -2101,6 +1963,57 @@ public:
 
   static bool classof(const Expr *E) { return E->getKind() == ExprKind::Paren; }
 };
+
+/// Represents the result of a chain of accesses or calls hanging off of an
+/// \c UnresolvedMemberExpr at the root. This is only used during type checking
+/// to give the result type of such a chain representation in the AST. This
+/// expression type is always implicit.
+class UnresolvedMemberChainResultExpr : public IdentityExpr {
+  /// The base of this chain of member accesses.
+  UnresolvedMemberExpr *ChainBase;
+public:
+  UnresolvedMemberChainResultExpr(Expr *subExpr, UnresolvedMemberExpr *base,
+                                  Type ty = Type())
+    : IdentityExpr(ExprKind::UnresolvedMemberChainResult, subExpr, ty,
+                   /*isImplicit=*/true),
+      ChainBase(base) {
+    assert(base);
+  }
+
+  UnresolvedMemberExpr *getChainBase() const { return ChainBase; }
+
+  SWIFT_FORWARD_SOURCE_LOCS_TO(getSubExpr())
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::UnresolvedMemberChainResult;
+  }
+};
+  
+/// AwaitExpr - An 'await' surrounding an expression, marking that the
+/// expression contains code which is a coroutine that may block.
+///
+/// getSemanticsProvidingExpr() looks through this because it doesn't
+/// provide the value and only very specific clients care where the
+/// 'await' was written.
+class AwaitExpr final : public IdentityExpr {
+  SourceLoc AwaitLoc;
+public:
+  AwaitExpr(SourceLoc awaitLoc, Expr *sub, Type type = Type(),
+            bool implicit = false)
+    : IdentityExpr(ExprKind::Await, sub, type, implicit), AwaitLoc(awaitLoc) {
+  }
+  
+  SourceLoc getLoc() const { return AwaitLoc; }
+  
+  SourceLoc getAwaitLoc() const { return AwaitLoc; }
+  SourceLoc getStartLoc() const { return AwaitLoc; }
+  SourceLoc getEndLoc() const { return getSubExpr()->getEndLoc(); }
+
+  static bool classof(const Expr *e) {
+    return e->getKind() == ExprKind::Await;
+  }
+};
+
   
 /// TupleExpr - Parenthesized expressions like '(a: x+x)' and '(x, y, 4)'.  Also
 /// used to represent the operands to a binary operator.  Note that
@@ -3700,6 +3613,9 @@ public:
   /// Return whether this closure is throwing when fully applied.
   bool isBodyThrowing() const;
 
+  /// \brief Return whether this closure is async when fully applied.
+  bool isBodyAsync() const;
+
   /// Whether this closure consists of a single expression.
   bool hasSingleExpressionBody() const;
 
@@ -3768,7 +3684,25 @@ public:
 ///     { [weak c] (a : Int) -> Int in a + c!.getFoo() }
 /// \endcode
 class ClosureExpr : public AbstractClosureExpr {
+public:
+  enum class BodyState {
+    /// The body was parsed, but not ready for type checking because
+    /// the closure parameters haven't been type checked.
+    Parsed,
 
+    /// The type of the closure itself was type checked. But the body has not
+    /// been type checked yet.
+    ReadyForTypeChecking,
+
+    /// The body was typechecked with the enclosing closure.
+    /// i.e. single expression closure or result builder closure.
+    TypeCheckedWithSignature,
+
+    /// The body was type checked separately from the enclosing closure.
+    SeparatelyTypeChecked,
+  };
+
+private:
   /// The range of the brackets of the capture list, if present.
   SourceRange BracketRange;
     
@@ -3781,6 +3715,9 @@ class ClosureExpr : public AbstractClosureExpr {
   /// this information directly on the ClosureExpr.
   VarDecl * CapturedSelfDecl;
 
+  /// The location of the "async", if present.
+  SourceLoc AsyncLoc;
+
   /// The location of the "throws", if present.
   SourceLoc ThrowsLoc;
   
@@ -3792,23 +3729,23 @@ class ClosureExpr : public AbstractClosureExpr {
   SourceLoc InLoc;
 
   /// The explicitly-specified result type.
-  llvm::PointerIntPair<TypeExpr *, 1, bool>
-    ExplicitResultTypeAndSeparatelyChecked;
+  llvm::PointerIntPair<TypeExpr *, 2, BodyState> ExplicitResultTypeAndBodyState;
 
   /// The body of the closure, along with a bit indicating whether it
   /// was originally just a single expression.
   llvm::PointerIntPair<BraceStmt *, 1, bool> Body;
 public:
   ClosureExpr(SourceRange bracketRange, VarDecl *capturedSelfDecl,
-              ParameterList *params, SourceLoc throwsLoc, SourceLoc arrowLoc,
-              SourceLoc inLoc, TypeExpr *explicitResultType,
+              ParameterList *params, SourceLoc asyncLoc, SourceLoc throwsLoc,
+              SourceLoc arrowLoc, SourceLoc inLoc, TypeExpr *explicitResultType,
               unsigned discriminator, DeclContext *parent)
     : AbstractClosureExpr(ExprKind::Closure, Type(), /*Implicit=*/false,
                           discriminator, parent),
       BracketRange(bracketRange),
       CapturedSelfDecl(capturedSelfDecl),
-      ThrowsLoc(throwsLoc), ArrowLoc(arrowLoc), InLoc(inLoc),
-      ExplicitResultTypeAndSeparatelyChecked(explicitResultType, false),
+      AsyncLoc(asyncLoc), ThrowsLoc(throwsLoc), ArrowLoc(arrowLoc),
+      InLoc(inLoc),
+      ExplicitResultTypeAndBodyState(explicitResultType, BodyState::Parsed),
       Body(nullptr) {
     setParameterList(params);
     Bits.ClosureExpr.HasAnonymousClosureVars = false;
@@ -3855,7 +3792,12 @@ public:
   SourceLoc getInLoc() const {
     return InLoc;
   }
-  
+
+  /// Retrieve the location of the 'async' for a closure that has it.
+  SourceLoc getAsyncLoc() const {
+    return AsyncLoc;
+  }
+
   /// Retrieve the location of the 'throws' for a closure that has it.
   SourceLoc getThrowsLoc() const {
     return ThrowsLoc;
@@ -3863,15 +3805,13 @@ public:
 
   Type getExplicitResultType() const {
     assert(hasExplicitResultType() && "No explicit result type");
-    return ExplicitResultTypeAndSeparatelyChecked.getPointer()
-        ->getInstanceType();
+    return ExplicitResultTypeAndBodyState.getPointer()->getInstanceType();
   }
   void setExplicitResultType(Type ty);
 
   TypeRepr *getExplicitResultTypeRepr() const {
     assert(hasExplicitResultType() && "No explicit result type");
-    return ExplicitResultTypeAndSeparatelyChecked.getPointer()
-        ->getTypeRepr();
+    return ExplicitResultTypeAndBodyState.getPointer()->getTypeRepr();
   }
 
   /// Determine whether the closure has a single expression for its
@@ -3907,20 +3847,20 @@ public:
   VarDecl *getCapturedSelfDecl() const {
     return CapturedSelfDecl;
   }
-  
-  /// Whether this closure captures the \c self param in its body in such a
-  /// way that implicit \c self is enabled within its body (i.e. \c self is
-  /// captured non-weakly).
-  bool capturesSelfEnablingImplictSelf() const;
 
-  /// Whether this closure's body was type checked separately from its
-  /// enclosing expression.
-  bool wasSeparatelyTypeChecked() const {
-    return ExplicitResultTypeAndSeparatelyChecked.getInt();
+  /// Get the type checking state of this closure's body.
+  BodyState getBodyState() const {
+    return ExplicitResultTypeAndBodyState.getInt();
+  }
+  void setBodyState(BodyState v) {
+    ExplicitResultTypeAndBodyState.setInt(v);
   }
 
-  void setSeparatelyTypeChecked(bool flag = true) {
-    ExplicitResultTypeAndSeparatelyChecked.setInt(flag);
+  /// Whether this closure's body is/was type checked separately from its
+  /// enclosing expression.
+  bool isSeparatelyTypeChecked() const {
+    return getBodyState() == BodyState::SeparatelyTypeChecked ||
+           getBodyState() == BodyState::ReadyForTypeChecking;
   }
 
   static bool classof(const Expr *E) {
@@ -4165,16 +4105,20 @@ class PropertyWrapperValuePlaceholderExpr : public Expr {
   SourceRange Range;
   OpaqueValueExpr *Placeholder;
   Expr *WrappedValue;
+  bool IsAutoClosure = false;
 
   PropertyWrapperValuePlaceholderExpr(SourceRange Range, Type Ty,
                                       OpaqueValueExpr *placeholder,
-                                      Expr *wrappedValue)
+                                      Expr *wrappedValue,
+                                      bool isAutoClosure)
       : Expr(ExprKind::PropertyWrapperValuePlaceholder, /*Implicit=*/true, Ty),
-        Range(Range), Placeholder(placeholder), WrappedValue(wrappedValue) {}
+        Range(Range), Placeholder(placeholder), WrappedValue(wrappedValue),
+        IsAutoClosure(isAutoClosure) {}
 
 public:
   static PropertyWrapperValuePlaceholderExpr *
-  create(ASTContext &ctx, SourceRange range, Type ty, Expr *wrappedValue);
+  create(ASTContext &ctx, SourceRange range, Type ty, Expr *wrappedValue,
+         bool isAutoClosure = false);
 
   /// The original wrappedValue initialization expression provided via
   /// \c = on a proprety with attached property wrappers.
@@ -4195,6 +4139,8 @@ public:
   void setOpaqueValuePlaceholder(OpaqueValueExpr *placeholder) {
     Placeholder = placeholder;
   }
+
+  bool isAutoClosure() const { return IsAutoClosure; }
 
   SourceRange getSourceRange() const { return Range; }
 
@@ -4528,16 +4474,10 @@ public:
 
   SourceLoc getDotLoc() const { return DotLoc; }
 
-  SourceLoc getLoc() const {
-    return isImplicit() ? getBase()->getStartLoc() : getFn()->getLoc();
-  }
-  SourceLoc getStartLoc() const {
-    return getBase()->getStartLoc();
-  }
-  SourceLoc getEndLoc() const {
-    return isImplicit() ? getBase()->getEndLoc() : getFn()->getEndLoc();
-  }
-  
+  SourceLoc getLoc() const;
+  SourceLoc getStartLoc() const;
+  SourceLoc getEndLoc() const;
+
   static bool classof(const Expr *E) {
     return E->getKind() == ExprKind::DotSyntaxCall;
   }
@@ -4707,7 +4647,7 @@ public:
 
 /// Represents an explicit conditional checked cast, which converts
 /// from a type to some subtype and produces an Optional value, which will be
-/// .Some(x) if the cast succeeds, or .None if the cast fails.
+/// .some(x) if the cast succeeds, or .none if the cast fails.
 /// Spelled 'a as? T' and produces a value of type 'T?'.
 class ConditionalCheckedCastExpr final : public CheckedCastExpr {
   SourceLoc QuestionLoc;
@@ -4724,9 +4664,6 @@ public:
 
   static ConditionalCheckedCastExpr *createImplicit(ASTContext &ctx, Expr *sub,
                                                     Type castTy);
-
-  static ConditionalCheckedCastExpr *
-  createImplicit(ASTContext &ctx, Expr *sub, TypeRepr *tyRepr, Type castTy);
 
   /// Retrieve the location of the '?' that follows 'as'.
   SourceLoc getQuestionLoc() const { return QuestionLoc; }
@@ -4797,25 +4734,30 @@ public:
 /// may be preceded by the 'throws' keyword. Currently this only exists to be
 /// transformed into a FunctionTypeRepr by simplifyTypeExpr() in Sema.
 class ArrowExpr : public Expr {
+  SourceLoc AsyncLoc;
   SourceLoc ThrowsLoc;
   SourceLoc ArrowLoc;
   Expr *Args;
   Expr *Result;
 public:
-  ArrowExpr(Expr *Args, SourceLoc ThrowsLoc, SourceLoc ArrowLoc, Expr *Result)
+  ArrowExpr(Expr *Args, SourceLoc AsyncLoc, SourceLoc ThrowsLoc,
+            SourceLoc ArrowLoc, Expr *Result)
     : Expr(ExprKind::Arrow, /*implicit=*/false, Type()),
-      ThrowsLoc(ThrowsLoc), ArrowLoc(ArrowLoc), Args(Args), Result(Result)
+      AsyncLoc(AsyncLoc), ThrowsLoc(ThrowsLoc), ArrowLoc(ArrowLoc), Args(Args),
+      Result(Result)
   { }
 
-  ArrowExpr(SourceLoc ThrowsLoc, SourceLoc ArrowLoc)
+  ArrowExpr(SourceLoc AsyncLoc, SourceLoc ThrowsLoc, SourceLoc ArrowLoc)
     : Expr(ExprKind::Arrow, /*implicit=*/false, Type()),
-      ThrowsLoc(ThrowsLoc), ArrowLoc(ArrowLoc), Args(nullptr), Result(nullptr)
+      AsyncLoc(AsyncLoc), ThrowsLoc(ThrowsLoc), ArrowLoc(ArrowLoc),
+      Args(nullptr), Result(nullptr)
   { }
 
   Expr *getArgsExpr() const { return Args; }
   void setArgsExpr(Expr *E) { Args = E; }
   Expr *getResultExpr() const { return Result; }
   void setResultExpr(Expr *E) { Result = E; }
+  SourceLoc getAsyncLoc() const { return AsyncLoc; }
   SourceLoc getThrowsLoc() const { return ThrowsLoc; }
   SourceLoc getArrowLoc() const { return ArrowLoc; }
   bool isFolded() const { return Args != nullptr && Result != nullptr; }
@@ -4823,6 +4765,7 @@ public:
   SourceLoc getSourceLoc() const { return ArrowLoc; }
   SourceLoc getStartLoc() const {
     return isFolded() ? Args->getStartLoc() :
+           AsyncLoc.isValid() ? AsyncLoc :
            ThrowsLoc.isValid() ? ThrowsLoc : ArrowLoc;
   }
   SourceLoc getEndLoc() const {
@@ -4914,20 +4857,21 @@ public:
 /// a particular case.
 class EnumIsCaseExpr : public Expr {
   Expr *SubExpr;
+  TypeRepr *CaseRepr;
   EnumElementDecl *Element;
   
 public:
-  EnumIsCaseExpr(Expr *SubExpr, EnumElementDecl *Element)
-    : Expr(ExprKind::EnumIsCase, /*implicit*/ true),
-      SubExpr(SubExpr), Element(Element)
-  {}
-  
+  EnumIsCaseExpr(Expr *SubExpr, TypeRepr *CaseRepr, EnumElementDecl *Element)
+      : Expr(ExprKind::EnumIsCase, /*implicit*/ true), SubExpr(SubExpr),
+        CaseRepr(CaseRepr), Element(Element) {}
+
   Expr *getSubExpr() const { return SubExpr; }
   void setSubExpr(Expr *e) { SubExpr = e; }
-  
+
+  TypeRepr *getCaseTypeRepr() const { return CaseRepr; }
+
   EnumElementDecl *getEnumElement() const { return Element; }
-  void setEnumElement(EnumElementDecl *elt) { Element = elt; }
-  
+
   SourceLoc getLoc() const { return SubExpr->getLoc(); }
   SourceLoc getStartLoc() const { return SubExpr->getStartLoc(); }
   SourceLoc getEndLoc() const { return SubExpr->getEndLoc(); }
@@ -5209,6 +5153,7 @@ public:
       OptionalWrap,
       Identity,
       TupleElement,
+      DictionaryKey,
     };
   
   private:
@@ -5317,6 +5262,16 @@ public:
                        propertyType,
                        loc);
     }
+
+    /// Create a component for a dictionary key (#keyPath only).
+    static Component forDictionaryKey(DeclNameRef UnresolvedName,
+                                      Type valueType,
+                                      SourceLoc loc) {
+      return Component(nullptr, UnresolvedName, nullptr, {}, {},
+                       Kind::DictionaryKey,
+                       valueType,
+                       loc);
+    }
     
     /// Create a component for a subscript.
     static Component forSubscript(ASTContext &ctx,
@@ -5380,6 +5335,13 @@ public:
       return Loc;
     }
     
+    SourceRange getSourceRange() const {
+      if (auto *indexExpr = getIndexExpr()) {
+        return indexExpr->getSourceRange();
+      }
+      return Loc;
+    }
+    
     Kind getKind() const {
       return KindValue;
     }
@@ -5400,6 +5362,7 @@ public:
       case Kind::Property:
       case Kind::Identity:
       case Kind::TupleElement:
+      case Kind::DictionaryKey:
         return true;
 
       case Kind::UnresolvedSubscript:
@@ -5424,6 +5387,7 @@ public:
       case Kind::Property:
       case Kind::Identity:
       case Kind::TupleElement:
+      case Kind::DictionaryKey:
         return nullptr;
       }
       llvm_unreachable("unhandled kind");
@@ -5443,6 +5407,7 @@ public:
       case Kind::Property:
       case Kind::Identity:
       case Kind::TupleElement:
+      case Kind::DictionaryKey:
         llvm_unreachable("no subscript labels for this kind");
       }
       llvm_unreachable("unhandled kind");
@@ -5465,6 +5430,7 @@ public:
       case Kind::Property:
       case Kind::Identity:
       case Kind::TupleElement:
+      case Kind::DictionaryKey:
         return {};
       }
       llvm_unreachable("unhandled kind");
@@ -5476,6 +5442,7 @@ public:
     DeclNameRef getUnresolvedDeclName() const {
       switch (getKind()) {
       case Kind::UnresolvedProperty:
+      case Kind::DictionaryKey:
         return Decl.UnresolvedName;
 
       case Kind::Invalid:
@@ -5506,6 +5473,7 @@ public:
       case Kind::OptionalForce:
       case Kind::Identity:
       case Kind::TupleElement:
+      case Kind::DictionaryKey:
         llvm_unreachable("no decl ref for this kind");
       }
       llvm_unreachable("unhandled kind");
@@ -5525,6 +5493,7 @@ public:
         case Kind::Identity:
         case Kind::Property:
         case Kind::Subscript:
+        case Kind::DictionaryKey:
           llvm_unreachable("no field number for this kind");
       }
       llvm_unreachable("unhandled kind");
@@ -5576,7 +5545,13 @@ public:
   /// components from the argument array.
   void resolveComponents(ASTContext &C,
                          ArrayRef<Component> resolvedComponents);
-  
+
+  /// Indicates if the key path expression is composed by a single invalid
+  /// component. e.g. missing component `\Root`
+  bool hasSingleInvalidComponent() const {
+    return Components.size() == 1 && !Components.front().isValid();
+  }
+
   /// Retrieve the string literal expression, which will be \c NULL prior to
   /// type checking and a string literal after type checking for an
   /// @objc key path.
@@ -5724,6 +5699,7 @@ Expr *packSingleArgument(
 
 void simple_display(llvm::raw_ostream &out, const ClosureExpr *CE);
 void simple_display(llvm::raw_ostream &out, const DefaultArgumentExpr *expr);
+void simple_display(llvm::raw_ostream &out, const Expr *expr);
 
 SourceLoc extractNearestSourceLoc(const DefaultArgumentExpr *expr);
 

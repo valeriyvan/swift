@@ -10,8 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/SIL/SILInstruction.h"
 #define DEBUG_TYPE "ConstExpr"
 #include "swift/SILOptimizer/Utils/ConstExpr.h"
+#include "swift/AST/Builtins.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/SubstitutionMap.h"
@@ -298,7 +300,7 @@ SymbolicValue ConstExprFunctionState::computeConstantValue(SILValue value) {
     auto val = getConstantValue(tei->getOperand());
     if (!val.isConstant())
       return val;
-    return val.getAggregateMembers()[tei->getFieldNo()];
+    return val.getAggregateMembers()[tei->getFieldIndex()];
   }
 
   // If this is a struct extract from a fragile type, then we can return the
@@ -310,7 +312,7 @@ SymbolicValue ConstExprFunctionState::computeConstantValue(SILValue value) {
       return val;
     }
     assert(val.getKind() == SymbolicValue::Aggregate);
-    return val.getAggregateMembers()[sei->getFieldNo()];
+    return val.getAggregateMembers()[sei->getFieldIndex()];
   }
 
   // If this is an unchecked_enum_data from a fragile type, then we can return
@@ -377,9 +379,9 @@ SymbolicValue ConstExprFunctionState::computeConstantValue(SILValue value) {
     // Add our index onto the next of the list.
     unsigned index;
     if (auto sea = dyn_cast<StructElementAddrInst>(inst))
-      index = sea->getFieldNo();
+      index = sea->getFieldIndex();
     else
-      index = cast<TupleElementAddrInst>(inst)->getFieldNo();
+      index = cast<TupleElementAddrInst>(inst)->getFieldIndex();
     accessPath.push_back(index);
     return SymbolicValue::getAddress(memObject, accessPath,
                                      evaluator.getAllocator());
@@ -1756,8 +1758,8 @@ ConstExprFunctionState::evaluateFlowSensitive(SILInstruction *inst) {
       isa<ReleaseValueInst>(inst) || isa<StrongRetainInst>(inst) ||
       isa<StrongReleaseInst>(inst) || isa<DestroyValueInst>(inst) ||
       isa<EndBorrowInst>(inst) ||
-      // Skip sanitizer instrumentation
-      isSanitizerInstrumentation(inst))
+      // Skip instrumentation
+      isInstrumentation(inst))
     return None;
 
   // If this is a special flow-sensitive instruction like a stack allocation,

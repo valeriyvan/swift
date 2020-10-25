@@ -87,6 +87,9 @@ llvm::cl::list<std::string>
     SILDisablePass("sil-disable-pass", llvm::cl::CommaSeparated,
                      llvm::cl::desc("Disable passes "
                                     "which contain a string from this list"));
+llvm::cl::list<std::string> SILDisablePassOnlyFun(
+    "sil-disable-pass-only-function", llvm::cl::CommaSeparated,
+    llvm::cl::desc("Apply -sil-disable-pass only on this function"));
 
 llvm::cl::list<std::string> SILVerifyBeforePass(
     "sil-verify-before-pass", llvm::cl::CommaSeparated,
@@ -204,7 +207,13 @@ static bool doPrintAfter(SILTransform *T, SILFunction *F, bool Default) {
   return Default;
 }
 
-static bool isDisabled(SILTransform *T) {
+static bool isDisabled(SILTransform *T, SILFunction *F = nullptr) {
+  if (!SILDisablePassOnlyFun.empty() && F &&
+      SILDisablePassOnlyFun.end() == std::find(SILDisablePassOnlyFun.begin(),
+                                               SILDisablePassOnlyFun.end(),
+                                               F->getName()))
+    return false;
+
   for (const std::string &NamePattern : SILDisablePass) {
     if (T->getTag().find(NamePattern) != StringRef::npos
         || T->getID().find(NamePattern) != StringRef::npos) {
@@ -374,11 +383,24 @@ void SILPassManager::dumpPassInfo(const char *Title, unsigned TransIdx,
   llvm::dbgs() << '\n';
 }
 
+bool SILPassManager::isMandatoryFunctionPass(SILFunctionTransform *sft) {
+  return isMandatory || sft->getPassKind() ==
+             PassKind::NonTransparentFunctionOwnershipModelEliminator ||
+         sft->getPassKind() == PassKind::OwnershipModelEliminator ||
+         sft->getPassKind() ==
+             PassKind::NonStdlibNonTransparentFunctionOwnershipModelEliminator;
+}
+
 void SILPassManager::runPassOnFunction(unsigned TransIdx, SILFunction *F) {
 
   assert(analysesUnlocked() && "Expected all analyses to be unlocked!");
 
   auto *SFT = cast<SILFunctionTransform>(Transformations[TransIdx]);
+
+  if (!F->shouldOptimize() && !isMandatoryFunctionPass(SFT)) {
+    return;
+  }
+
   SFT->injectPassManager(this);
   SFT->injectFunction(F);
 
@@ -386,16 +408,17 @@ void SILPassManager::runPassOnFunction(unsigned TransIdx, SILFunction *F) {
   DebugPrintEnabler DebugPrint(NumPassesRun);
 
   // If nothing changed since the last run of this pass, we can skip this
-  // pass.
+  // pass if it is not mandatory
   CompletedPasses &completedPasses = CompletedPassesMap[F];
-  if (completedPasses.test((size_t)SFT->getPassKind()) &&
+  if (!isMandatoryFunctionPass(SFT) &&
+      completedPasses.test((size_t)SFT->getPassKind()) &&
       !SILDisableSkippingPasses) {
     if (SILPrintPassName)
       dumpPassInfo("(Skip)", TransIdx, F);
     return;
   }
 
-  if (isDisabled(SFT)) {
+  if (isDisabled(SFT, F)) {
     if (SILPrintPassName)
       dumpPassInfo("(Disabled)", TransIdx, F);
     return;
@@ -491,9 +514,8 @@ runFunctionPasses(unsigned FromTransIdx, unsigned ToTransIdx) {
     return;
 
   BasicCalleeAnalysis *BCA = getAnalysis<BasicCalleeAnalysis>();
-  BottomUpFunctionOrder BottomUpOrder(BCA);
-  BottomUpOrder.computeBottomUpOrder(Mod);
-  auto BottomUpFunctions = BottomUpOrder.getBottomUpOrder();
+  BottomUpFunctionOrder BottomUpOrder(*Mod, BCA);
+  auto BottomUpFunctions = BottomUpOrder.getFunctions();
 
   assert(FunctionWorklist.empty() && "Expected empty function worklist!");
 
@@ -504,7 +526,7 @@ runFunctionPasses(unsigned FromTransIdx, unsigned ToTransIdx) {
 
     // Only include functions that are definitions, and which have not
     // been intentionally excluded from optimization.
-    if (F.isDefinition() && (isMandatory || F.shouldOptimize()))
+    if (F.isDefinition())
       FunctionWorklist.push_back(*I);
   }
 
@@ -546,47 +568,6 @@ runFunctionPasses(unsigned FromTransIdx, unsigned ToTransIdx) {
       ++Entry.PipelineIdx;
     }
     clearRestartPipeline();
-
-    if (TailIdx == (FunctionWorklist.size() - 1))  {
-      // No new functions to process
-      continue;
-    }
-
-    // Compute the bottom up order of the new functions and the callees in it
-    BottomUpFunctionOrder SubBottomUpOrder(BCA);
-    // Initialize BottomUpFunctionOrder with new functions
-    for (auto It = FunctionWorklist.begin() + TailIdx + 1;
-         It != FunctionWorklist.end(); It++) {
-      SubBottomUpOrder.computeBottomUpOrder(It->F);
-    }
-    auto NewFunctionsBottomUp = SubBottomUpOrder.getBottomUpOrder();
-    SmallPtrSet<SILFunction *, 8> NewBottomUpSet(NewFunctionsBottomUp.begin(),
-                                                 NewFunctionsBottomUp.end());
-
-    // Remove all the functions in the new bottom up order from FunctionWorklist
-    llvm::DenseMap<SILFunction *, WorklistEntry> FunctionsToReorder;
-    auto RemoveFn = [&FunctionsToReorder,
-                     &NewBottomUpSet](WorklistEntry Entry) {
-      if (NewBottomUpSet.find(Entry.F) == NewBottomUpSet.end()) {
-        return false;
-      }
-      FunctionsToReorder.insert(std::make_pair(Entry.F, Entry));
-      return true;
-    };
-    std::remove_if(FunctionWorklist.begin(), FunctionWorklist.end(), RemoveFn);
-    FunctionWorklist.erase((FunctionWorklist.begin() + FunctionWorklist.size() -
-                            FunctionsToReorder.size()),
-                           FunctionWorklist.end());
-
-    // Add back the functions in the new bottom up order to the FunctionWorklist
-    for (auto it = NewFunctionsBottomUp.rbegin();
-         it != NewFunctionsBottomUp.rend(); it++) {
-      auto Entry = FunctionsToReorder.find(*it);
-      if (Entry == FunctionsToReorder.end()) {
-        continue;
-      }
-      FunctionWorklist.push_back((*Entry).second);
-    }
   }
 }
 

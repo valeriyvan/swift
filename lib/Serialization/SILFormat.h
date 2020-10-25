@@ -31,7 +31,6 @@ using SILTypeCategoryField = BCFixed<2>;
 
 enum SILStringEncoding : uint8_t {
   SIL_UTF8,
-  SIL_UTF16,
   SIL_OBJC_SELECTOR,
   SIL_BYTES
 };
@@ -281,6 +280,8 @@ namespace sil_block {
                      BCFixed<3>,  // specialPurpose
                      BCFixed<2>,  // inlineStrategy
                      BCFixed<2>,  // optimizationMode
+                     BCFixed<2>,  // classSubclassScope
+                     BCFixed<1>,  // hasCReferences
                      BCFixed<3>,  // side effect info.
                      BCVBR<8>,    // number of specialize attributes
                      BCFixed<1>,  // has qualified ownership
@@ -301,7 +302,10 @@ namespace sil_block {
       BCRecordLayout<SIL_SPECIALIZE_ATTR,
                      BCFixed<1>, // exported
                      BCFixed<1>, // specialization kind
-                     GenericSignatureIDField // specialized signature
+                     GenericSignatureIDField, // specialized signature
+                     DeclIDField, // Target SILFunction name or 0.
+                     DeclIDField,  // SPIGroup or 0.
+                     DeclIDField // SPIGroup Module name id.
                      >;
 
   // Has an optional argument list where each argument is a typed valueref.

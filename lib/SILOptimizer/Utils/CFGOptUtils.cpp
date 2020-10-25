@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
+#include "swift/Basic/STLExtras.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/Dominance.h"
@@ -448,6 +449,20 @@ void swift::replaceBranchTarget(TermInst *t, SILBasicBlock *oldDest,
     yi->eraseFromParent();
     return;
   }
+      
+  case TermKind::AwaitAsyncContinuationInst: {
+    auto ai = cast<AwaitAsyncContinuationInst>(t);
+    SILBasicBlock *resumeBB =
+      (oldDest == ai->getResumeBB() ? newDest : ai->getResumeBB());
+    SILBasicBlock *errorBB =
+      (oldDest == ai->getErrorBB() ? newDest : ai->getErrorBB());
+    
+    builder.createAwaitAsyncContinuation(ai->getLoc(),
+                                         ai->getOperand(),
+                                         resumeBB, errorBB);
+    ai->eraseFromParent();
+    return;
+  }
 
   case TermKind::ReturnInst:
   case TermKind::ThrowInst:
@@ -548,6 +563,20 @@ bool swift::splitCriticalEdgesFrom(SILBasicBlock *fromBB,
         splitCriticalEdge(fromBB->getTerminator(), idx, domInfo, loopInfo);
     changed |= (newBB != nullptr);
   }
+  return changed;
+}
+
+bool swift::splitCriticalEdgesTo(SILBasicBlock *toBB, DominanceInfo *domInfo,
+                                 SILLoopInfo *loopInfo) {
+  bool changed = false;
+  unsigned numPreds = std::distance(toBB->pred_begin(), toBB->pred_end());
+
+  for (unsigned idx = 0; idx != numPreds; ++idx) {
+    SILBasicBlock *fromBB = *std::next(toBB->pred_begin(), idx);
+    auto *newBB = splitIfCriticalEdge(fromBB, toBB);
+    changed |= (newBB != nullptr);
+  }
+
   return changed;
 }
 
@@ -711,6 +740,7 @@ static bool isSafeNonExitTerminator(TermInst *ti) {
   // yield is special because it can do arbitrary,
   // potentially-process-terminating things.
   case TermKind::YieldInst:
+  case TermKind::AwaitAsyncContinuationInst:
     return false;
   case TermKind::TryApplyInst:
     return true;

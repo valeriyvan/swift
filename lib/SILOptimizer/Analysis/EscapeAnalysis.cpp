@@ -1623,6 +1623,13 @@ void EscapeAnalysis::ConnectionGraph::verify() const {
       if (auto ai = dyn_cast<ApplyInst>(&i)) {
         if (EA->canOptimizeArrayUninitializedCall(ai).isValid())
           continue;
+        // Ignore checking CGNode mapping for result of apply to a no return
+        // function that will have a null ReturnNode
+        if (auto *callee = ai->getReferencedFunctionOrNull()) {
+          if (EA->getFunctionInfo(callee)->isValid())
+            if (!EA->getConnectionGraph(callee)->getReturnNodeOrNull())
+              continue;
+        }
       }
       for (auto result : i.getResults()) {
         if (EA->getPointerBase(result))
@@ -1864,11 +1871,11 @@ EscapeAnalysis::canOptimizeArrayUninitializedCall(ApplyInst *ai) {
   // uses must be mapped to ConnectionGraph nodes by the client of this API.
   for (Operand *use : getNonDebugUses(ai)) {
     if (auto *tei = dyn_cast<TupleExtractInst>(use->getUser())) {
-      if (tei->getFieldNo() == 0 && !call.arrayStruct) {
+      if (tei->getFieldIndex() == 0 && !call.arrayStruct) {
         call.arrayStruct = tei;
         continue;
       }
-      if (tei->getFieldNo() == 1 && !call.arrayElementPtr) {
+      if (tei->getFieldIndex() == 1 && !call.arrayElementPtr) {
         call.arrayElementPtr = tei;
         continue;
       }
@@ -2078,6 +2085,10 @@ void EscapeAnalysis::analyzeInstruction(SILInstruction *I,
     if (getPointerBase(SVI))
       return;
   }
+
+  // Incidental uses produce no values and have no effect on their operands.
+  if (isIncidentalUse(I))
+    return;
 
   // Instructions which return the address of non-writable memory cannot have
   // an effect on escaping.

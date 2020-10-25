@@ -383,7 +383,7 @@ emitDataForSwiftSerializedModule(ModuleDecl *module,
                                  IndexUnitWriter &parentUnitWriter,
                                  SourceFile *initialFile);
 
-static void addModuleDependencies(ArrayRef<ModuleDecl::ImportedModule> imports,
+static void addModuleDependencies(ArrayRef<ImportedModule> imports,
                                   StringRef indexStorePath,
                                   bool indexSystemModules,
                                   bool skipStdlib,
@@ -580,11 +580,9 @@ emitDataForSwiftSerializedModule(ModuleDecl *module,
     unitWriter.addRecordFile(recordFile, *FE, isSystemModule, mod);
   }
 
-  ModuleDecl::ImportFilter importFilter;
-  importFilter |= ModuleDecl::ImportFilterKind::Public;
-  importFilter |= ModuleDecl::ImportFilterKind::Private;
-  SmallVector<ModuleDecl::ImportedModule, 8> imports;
-  module->getImportedModules(imports, importFilter);
+  SmallVector<ImportedModule, 8> imports;
+  module->getImportedModules(imports, {ModuleDecl::ImportFilterKind::Exported,
+                                       ModuleDecl::ImportFilterKind::Default});
   StringScratchSpace moduleNameScratch;
   addModuleDependencies(imports, indexStorePath, indexSystemModules, skipStdlib,
                         targetTriple, clangCI, diags, unitWriter,
@@ -621,13 +619,11 @@ recordSourceFileUnit(SourceFile *primarySourceFile, StringRef indexUnitToken,
       getModuleInfoFromOpaqueModule);
 
   // Module dependencies.
-  ModuleDecl::ImportFilter importFilter;
-  importFilter |= ModuleDecl::ImportFilterKind::Public;
-  importFilter |= ModuleDecl::ImportFilterKind::Private;
-  importFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
-
-  SmallVector<ModuleDecl::ImportedModule, 8> imports;
-  primarySourceFile->getImportedModules(imports, importFilter);
+  SmallVector<ImportedModule, 8> imports;
+  primarySourceFile->getImportedModules(
+      imports, {ModuleDecl::ImportFilterKind::Exported,
+                ModuleDecl::ImportFilterKind::Default,
+                ModuleDecl::ImportFilterKind::ImplementationOnly});
   StringScratchSpace moduleNameScratch;
   addModuleDependencies(imports, indexStorePath, indexSystemModules, skipStdlib,
                         targetTriple, clangCI, diags, unitWriter,

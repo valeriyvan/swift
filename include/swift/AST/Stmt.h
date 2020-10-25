@@ -39,6 +39,8 @@ class Pattern;
 class PatternBindingDecl;
 class VarDecl;
 class CaseStmt;
+class DoCatchStmt;
+class SwitchStmt;
 
 enum class StmtKind {
 #define STMT(ID, PARENT) ID,
@@ -630,17 +632,17 @@ public:
 ///
 class GuardStmt : public LabeledConditionalStmt {
   SourceLoc GuardLoc;
-  Stmt *Body;
+  BraceStmt *Body;
   
 public:
   GuardStmt(SourceLoc GuardLoc, StmtCondition Cond,
-            Stmt *Body, Optional<bool> implicit = None)
+            BraceStmt *Body, Optional<bool> implicit = None)
   : LabeledConditionalStmt(StmtKind::Guard,
                            getDefaultImplicitFlag(implicit, GuardLoc),
                            LabeledStmtInfo(), Cond),
     GuardLoc(GuardLoc), Body(Body) {}
   
-  GuardStmt(SourceLoc GuardLoc, Expr *Cond, Stmt *Body,
+  GuardStmt(SourceLoc GuardLoc, Expr *Cond, BraceStmt *Body,
             Optional<bool> implicit, ASTContext &Ctx);
   
   SourceLoc getGuardLoc() const { return GuardLoc; }
@@ -652,8 +654,8 @@ public:
     return Body->getEndLoc();
   }
   
-  Stmt *getBody() const { return Body; }
-  void setBody(Stmt *s) { Body = s; }
+  BraceStmt *getBody() const { return Body; }
+  void setBody(BraceStmt *s) { Body = s; }
   
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Stmt *S) { return S->getKind() == StmtKind::Guard; }
@@ -812,13 +814,13 @@ class CaseLabelItem {
     Default,
   };
 
-  Pattern *CasePattern;
+  llvm::PointerIntPair<Pattern *, 1, bool> CasePatternAndResolved;
   SourceLoc WhereLoc;
   llvm::PointerIntPair<Expr *, 1, Kind> GuardExprAndKind;
 
   CaseLabelItem(Kind kind, Pattern *casePattern, SourceLoc whereLoc,
                 Expr *guardExpr)
-    : CasePattern(casePattern), WhereLoc(whereLoc),
+    : CasePatternAndResolved(casePattern, false), WhereLoc(whereLoc),
       GuardExprAndKind(guardExpr, kind) {}
 
 public:
@@ -846,9 +848,19 @@ public:
   SourceLoc getEndLoc() const;
   SourceRange getSourceRange() const;
 
-  Pattern *getPattern() { return CasePattern; }
-  const Pattern *getPattern() const { return CasePattern; }
-  void setPattern(Pattern *CasePattern) { this->CasePattern = CasePattern; }
+  Pattern *getPattern() {
+    return CasePatternAndResolved.getPointer();
+  }
+  const Pattern *getPattern() const {
+    return CasePatternAndResolved.getPointer();
+  }
+  bool isPatternResolved() const {
+    return CasePatternAndResolved.getInt();
+  }
+  void setPattern(Pattern *CasePattern, bool resolved) {
+    this->CasePatternAndResolved.setPointer(CasePattern);
+    this->CasePatternAndResolved.setInt(resolved);
+  }
 
   /// Return the guard expression if present, or null if the case label has
   /// no guard.
@@ -927,18 +939,19 @@ class CaseStmt final
                                     CaseLabelItem> {
   friend TrailingObjects;
 
+  Stmt *ParentStmt = nullptr;
   SourceLoc UnknownAttrLoc;
   SourceLoc ItemIntroducerLoc;
   SourceLoc ItemTerminatorLoc;
   CaseParentKind ParentKind;
 
-  llvm::PointerIntPair<Stmt *, 1, bool> BodyAndHasFallthrough;
+  llvm::PointerIntPair<BraceStmt *, 1, bool> BodyAndHasFallthrough;
 
   Optional<MutableArrayRef<VarDecl *>> CaseBodyVariables;
 
   CaseStmt(CaseParentKind ParentKind, SourceLoc ItemIntroducerLoc,
            ArrayRef<CaseLabelItem> CaseLabelItems, SourceLoc UnknownAttrLoc,
-           SourceLoc ItemTerminatorLoc, Stmt *Body,
+           SourceLoc ItemTerminatorLoc, BraceStmt *Body,
            Optional<MutableArrayRef<VarDecl *>> CaseBodyVariables,
            Optional<bool> Implicit,
            NullablePtr<FallthroughStmt> fallthroughStmt);
@@ -947,12 +960,20 @@ public:
   static CaseStmt *
   create(ASTContext &C, CaseParentKind ParentKind, SourceLoc ItemIntroducerLoc,
          ArrayRef<CaseLabelItem> CaseLabelItems, SourceLoc UnknownAttrLoc,
-         SourceLoc ItemTerminatorLoc, Stmt *Body,
+         SourceLoc ItemTerminatorLoc, BraceStmt *Body,
          Optional<MutableArrayRef<VarDecl *>> CaseBodyVariables,
          Optional<bool> Implicit = None,
          NullablePtr<FallthroughStmt> fallthroughStmt = nullptr);
 
   CaseParentKind getParentKind() const { return ParentKind; }
+
+  Stmt *getParentStmt() const { return ParentStmt; }
+  void setParentStmt(Stmt *S) {
+    assert(S && "Parent statement must be SwitchStmt or DoCatchStmt");
+    assert((ParentKind == CaseParentKind::Switch && isa<SwitchStmt>(S)) ||
+           (ParentKind == CaseParentKind::DoCatch && isa<DoCatchStmt>(S)));
+    ParentStmt = S;
+  }
 
   ArrayRef<CaseLabelItem> getCaseLabelItems() const {
     return {getTrailingObjects<CaseLabelItem>(), Bits.CaseStmt.NumPatterns};
@@ -976,8 +997,8 @@ public:
 
   bool hasFallthroughDest() const { return BodyAndHasFallthrough.getInt(); }
 
-  Stmt *getBody() const { return BodyAndHasFallthrough.getPointer(); }
-  void setBody(Stmt *body) { BodyAndHasFallthrough.setPointer(body); }
+  BraceStmt *getBody() const { return BodyAndHasFallthrough.getPointer(); }
+  void setBody(BraceStmt *body) { BodyAndHasFallthrough.setPointer(body); }
 
   /// True if the case block declares any patterns with local variable bindings.
   bool hasBoundDecls() const { return CaseBodyVariables.hasValue(); }
@@ -1061,6 +1082,10 @@ public:
       return MutableArrayRef<VarDecl *>();
     return *CaseBodyVariables;
   }
+
+  /// Find the next case statement within the same 'switch' or 'do-catch',
+  /// if there is one.
+  CaseStmt *findNextCaseStmt() const;
 
   static bool classof(const Stmt *S) { return S->getKind() == StmtKind::Case; }
 
@@ -1161,6 +1186,8 @@ class DoCatchStmt final
     Bits.DoCatchStmt.NumCatches = catches.size();
     std::uninitialized_copy(catches.begin(), catches.end(),
                             getTrailingObjects<CaseStmt *>());
+    for (auto *catchStmt : getCatches())
+      catchStmt->setParentStmt(this);
   }
 
 public:
@@ -1338,6 +1365,13 @@ class PoundAssertStmt : public Stmt {
   static bool classof(const Stmt *S) {
     return S->getKind() == StmtKind::PoundAssert;
   }
+};
+
+inline void simple_display(llvm::raw_ostream &out, Stmt *S) {
+  if (S)
+    out << Stmt::getKindName(S->getKind());
+  else
+    out << "(null)";
 };
 
 } // end namespace swift

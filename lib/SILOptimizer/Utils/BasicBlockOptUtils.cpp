@@ -44,6 +44,11 @@ bool ReachableBlocks::visit(SILFunction *f,
 /// Remove all instructions in the body of \p bb in safe manner by using
 /// undef.
 void swift::clearBlockBody(SILBasicBlock *bb) {
+
+  for (SILArgument *arg : bb->getArguments()) {
+    arg->replaceAllUsesWithUndef();
+  }
+
   // Instructions in the dead block may be used by other dead blocks.  Replace
   // any uses of them with undef values.
   while (!bb->empty()) {
@@ -107,9 +112,9 @@ void BasicBlockCloner::updateSSAAfterCloning() {
     for (auto *use : inst->getUses())
       useList.push_back(UseWrapper(use));
 
-    ssaUpdater.Initialize(inst->getType());
-    ssaUpdater.AddAvailableValue(origBB, inst);
-    ssaUpdater.AddAvailableValue(getNewBB(), newResult);
+    ssaUpdater.initialize(inst->getType());
+    ssaUpdater.addAvailableValue(origBB, inst);
+    ssaUpdater.addAvailableValue(getNewBB(), newResult);
 
     if (useList.empty())
       continue;
@@ -124,7 +129,7 @@ void BasicBlockCloner::updateSSAAfterCloning() {
       if (user->getParent() == origBB)
         continue;
 
-      ssaUpdater.RewriteUse(*use);
+      ssaUpdater.rewriteUse(*use);
     }
   }
 }

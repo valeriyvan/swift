@@ -375,6 +375,12 @@ public:
     /// The instruction may read memory.
     MayRead,
     /// The instruction may write to memory.
+    /// This includes destroying or taking from memory (e.g. destroy_addr,
+    /// copy_addr [take], load [take]).
+    /// Although, physically, destroying or taking does not modify the memory,
+    /// it is important to model it is a write. Optimizations must not assume
+    /// that the value stored in memory is still available for loading after
+    /// the memory is destroyed or taken.
     MayWrite,
     /// The instruction may read or write memory.
     MayReadWrite,
@@ -508,6 +514,10 @@ public:
            "Operand does not belong to a SILInstruction");
     return isTypeDependentOperand(Op.getOperandNumber());
   }
+      
+  /// Returns true if evaluation of this instruction may cause suspension of an
+  /// async task.
+  bool maySuspend() const;
 
 private:
   /// Predicate used to filter OperandValueRange.
@@ -3033,6 +3043,65 @@ public:
   }
 };
 
+/// Base class for instructions that access the continuation of an async task,
+/// in order to set up a suspension.
+/// The continuation must be consumed by an AwaitAsyncContinuation instruction locally,
+/// and must dynamically be resumed exactly once during the program's ensuing execution.
+class GetAsyncContinuationInstBase
+    : public SingleValueInstruction
+{
+protected:
+  using SingleValueInstruction::SingleValueInstruction;
+  
+public:
+  /// Get the type of the value the async task receives on a resume.
+  CanType getFormalResumeType() const;
+  SILType getLoweredResumeType() const;
+  
+  /// True if the continuation can be used to resume the task by throwing an error.
+  bool throws() const;
+  
+  static bool classof(const SILNode *I) {
+    return I->getKind() >= SILNodeKind::First_GetAsyncContinuationInstBase &&
+           I->getKind() <= SILNodeKind::Last_GetAsyncContinuationInstBase;
+  }
+};
+
+/// Accesses the continuation for an async task, to prepare a primitive suspend operation.
+class GetAsyncContinuationInst final
+    : public InstructionBase<SILInstructionKind::GetAsyncContinuationInst,
+                             GetAsyncContinuationInstBase>
+{
+  friend SILBuilder;
+  
+  GetAsyncContinuationInst(SILDebugLocation Loc,
+                           SILType ContinuationTy)
+    : InstructionBase(Loc, ContinuationTy)
+  {}
+  
+public:
+  ArrayRef<Operand> getAllOperands() const { return {}; }
+  MutableArrayRef<Operand> getAllOperands() { return {}; }
+};
+
+/// Accesses the continuation for an async task, to prepare a primitive suspend operation.
+/// The continuation must be consumed by an AwaitAsyncContinuation instruction locally,
+/// and must dynamically be resumed exactly once during the program's ensuing execution.
+///
+/// This variation of the instruction additionally takes an operand for the address of the
+/// buffer that receives the incoming value when the continuation is resumed.
+class GetAsyncContinuationAddrInst final
+    : public UnaryInstructionBase<SILInstructionKind::GetAsyncContinuationAddrInst,
+                                  GetAsyncContinuationInstBase>
+{
+  friend SILBuilder;
+  GetAsyncContinuationAddrInst(SILDebugLocation Loc,
+                               SILValue Operand,
+                               SILType ContinuationTy)
+    : UnaryInstructionBase(Loc, Operand, ContinuationTy)
+  {}
+};
+
 /// Instantiates a key path object.
 class KeyPathInst final
     : public InstructionBase<SILInstructionKind::KeyPathInst,
@@ -3207,6 +3276,20 @@ public:
       : InstructionBase(DebugLoc, Ty, nullptr) {}
 };
 
+/// Creates a base address for offset calculations.
+class BaseAddrForOffsetInst
+    : public InstructionBase<SILInstructionKind::BaseAddrForOffsetInst,
+                             LiteralInst> {
+  friend SILBuilder;
+
+  BaseAddrForOffsetInst(SILDebugLocation DebugLoc, SILType Ty)
+      : InstructionBase(DebugLoc, Ty) {}
+
+public:
+  ArrayRef<Operand> getAllOperands() const { return {}; }
+  MutableArrayRef<Operand> getAllOperands() { return {}; }
+};
+
 /// Gives the value of a global variable.
 ///
 /// The referenced global variable must be a statically initialized object.
@@ -3287,7 +3370,6 @@ public:
   enum class Encoding {
     Bytes,
     UTF8,
-    UTF16,
     /// UTF-8 encoding of an Objective-C selector.
     ObjCSelector,
   };
@@ -3931,6 +4013,16 @@ class AssignByWrapperInst
     : public AssignInstBase<SILInstructionKind::AssignByWrapperInst, 4> {
   friend SILBuilder;
 
+public:
+  /// The assignment destination for the property wrapper
+  enum class Destination {
+    BackingWrapper,
+    WrappedValue,
+  };
+
+private:
+  Destination AssignDest = Destination::WrappedValue;
+
   AssignByWrapperInst(SILDebugLocation DebugLoc, SILValue Src, SILValue Dest,
                        SILValue Initializer, SILValue Setter,
                        AssignOwnershipQualifier Qualifier =
@@ -3945,8 +4037,16 @@ public:
     return AssignOwnershipQualifier(
       SILInstruction::Bits.AssignByWrapperInst.OwnershipQualifier);
   }
-  void setOwnershipQualifier(AssignOwnershipQualifier qualifier) {
+
+  Destination getAssignDestination() const { return AssignDest; }
+
+  void setAssignInfo(AssignOwnershipQualifier qualifier, Destination dest) {
+    assert(qualifier == AssignOwnershipQualifier::Init && dest == Destination::BackingWrapper ||
+           qualifier == AssignOwnershipQualifier::Reassign && dest == Destination::BackingWrapper ||
+           qualifier == AssignOwnershipQualifier::Reassign && dest == Destination::WrappedValue);
+
     SILInstruction::Bits.AssignByWrapperInst.OwnershipQualifier = unsigned(qualifier);
+    AssignDest = dest;
   }
 };
 
@@ -4556,6 +4656,23 @@ class UncheckedBitwiseCastInst final
          SILFunction &F, SILOpenedArchetypesState &OpenedArchetypes);
 };
 
+/// Bitwise copy a value into another value of the same size.
+class UncheckedValueCastInst final
+    : public UnaryInstructionWithTypeDependentOperandsBase<
+          SILInstructionKind::UncheckedValueCastInst, UncheckedValueCastInst,
+          OwnershipForwardingConversionInst> {
+  friend SILBuilder;
+
+  UncheckedValueCastInst(SILDebugLocation DebugLoc, SILValue Operand,
+                         ArrayRef<SILValue> TypeDependentOperands, SILType Ty)
+      : UnaryInstructionWithTypeDependentOperandsBase(
+            DebugLoc, Operand, TypeDependentOperands, Ty,
+            Operand.getOwnershipKind()) {}
+  static UncheckedValueCastInst *
+  create(SILDebugLocation DebugLoc, SILValue Operand, SILType Ty,
+         SILFunction &F, SILOpenedArchetypesState &OpenedArchetypes);
+};
+
 /// Build a Builtin.BridgeObject from a heap object reference by bitwise-or-ing
 /// in bits from a word.
 class RefToBridgeObjectInst
@@ -4670,13 +4787,14 @@ class Name##ToRefInst \
 class ThinToThickFunctionInst final
     : public UnaryInstructionWithTypeDependentOperandsBase<
           SILInstructionKind::ThinToThickFunctionInst, ThinToThickFunctionInst,
-          ConversionInst> {
+          OwnershipForwardingConversionInst> {
   friend SILBuilder;
 
   ThinToThickFunctionInst(SILDebugLocation DebugLoc, SILValue Operand,
                           ArrayRef<SILValue> TypeDependentOperands, SILType Ty)
       : UnaryInstructionWithTypeDependentOperandsBase(
-            DebugLoc, Operand, TypeDependentOperands, Ty) {}
+            DebugLoc, Operand, TypeDependentOperands, Ty,
+            Operand.getOwnershipKind()) {}
 
   static ThinToThickFunctionInst *
   create(SILDebugLocation DebugLoc, SILValue Operand, SILType Ty,
@@ -5661,7 +5779,7 @@ class TupleExtractInst
   }
 
 public:
-  unsigned getFieldNo() const {
+  unsigned getFieldIndex() const {
     return SILInstruction::Bits.TupleExtractInst.FieldNo;
   }
 
@@ -5693,7 +5811,7 @@ class TupleElementAddrInst
   }
 
 public:
-  unsigned getFieldNo() const {
+  unsigned getFieldIndex() const {
     return SILInstruction::Bits.TupleElementAddrInst.FieldNo;
   }
 
@@ -5702,6 +5820,24 @@ public:
     return getOperand()->getType().castTo<TupleType>();
   }
 };
+
+/// Get a unique index for a struct or class field in layout order.
+///
+/// Precondition: \p decl must be a non-resilient struct or class.
+///
+/// Precondition: \p field must be a stored property declared in \p decl,
+///               not in a superclass.
+///
+/// Postcondition: The returned index is unique across all properties in the
+///                object, including properties declared in a superclass.
+unsigned getFieldIndex(NominalTypeDecl *decl, VarDecl *property);
+
+/// Get the property for a struct or class by its unique index, or nullptr if
+/// the index does not match a property declared in this struct or class or
+/// one its superclasses.
+///
+/// Precondition: \p decl must be a non-resilient struct or class.
+VarDecl *getIndexedField(NominalTypeDecl *decl, unsigned index);
 
 /// A common base for instructions that require a cached field index.
 ///
@@ -5737,8 +5873,7 @@ public:
 
   VarDecl *getField() const { return field; }
 
-  // FIXME: this should be called getFieldIndex().
-  unsigned getFieldNo() const {
+  unsigned getFieldIndex() const {
     unsigned idx = SILInstruction::Bits.FieldIndexCacheBase.FieldIndex;
     if (idx != InvalidFieldIndex)
       return idx;
@@ -5750,6 +5885,13 @@ public:
     auto s = getOperand(0)->getType().getNominalOrBoundGenericNominal();
     assert(s);
     return s;
+  }
+
+  static bool classof(const SILNode *node) {
+    SILNodeKind kind = node->getKind();
+    return kind == SILNodeKind::StructExtractInst ||
+           kind == SILNodeKind::StructElementAddrInst ||
+           kind == SILNodeKind::RefElementAddrInst;
   }
 
 private:
@@ -7151,6 +7293,7 @@ public:
     case TermKind::DynamicMethodBranchInst:
     case TermKind::CheckedCastAddrBranchInst:
     case TermKind::CheckedCastValueBranchInst:
+    case TermKind::AwaitAsyncContinuationInst:
       return false;
     case TermKind::SwitchEnumInst:
     case TermKind::CheckedCastBranchInst:
@@ -7244,6 +7387,52 @@ public:
 
   ArrayRef<Operand> getAllOperands() const { return {}; }
   MutableArrayRef<Operand> getAllOperands() { return {}; }
+};
+
+/// Suspend execution of an async task until
+/// essentially just a funny kind of return).
+class AwaitAsyncContinuationInst final
+  : public UnaryInstructionBase<SILInstructionKind::AwaitAsyncContinuationInst,
+                                TermInst>
+{
+  friend SILBuilder;
+  
+  std::array<SILSuccessor, 2> Successors;
+  
+  AwaitAsyncContinuationInst(SILDebugLocation Loc, SILValue Continuation,
+                             SILBasicBlock *resumeBB,
+                             SILBasicBlock *errorBBOrNull)
+    : UnaryInstructionBase(Loc, Continuation),
+      Successors{{{this}, {this}}}
+  {
+    Successors[0] = resumeBB;
+    if (errorBBOrNull)
+      Successors[1] = errorBBOrNull;
+  }
+  
+public:
+  /// Returns the basic block to which control is transferred when the task is
+  /// resumed normally.
+  ///
+  /// This basic block should take an argument of the continuation's resume type,
+  /// unless the continuation is formed by a \c GetAsyncContinuationAddrInst
+  /// that binds a specific memory location to receive the resume value.
+  SILBasicBlock *getResumeBB() const { return Successors[0].getBB(); }
+  
+  /// Returns the basic block to which control is transferred when the task is
+  /// resumed in an error state, or `nullptr` if the continuation does not support
+  /// failure.
+  ///
+  /// This basic block should take an argument of Error type.
+  SILBasicBlock *getErrorBB() const {
+    return Successors[1].getBB();
+  }
+  
+  SuccessorListTy getSuccessors() {
+    if (getErrorBB())
+      return Successors;
+    return SuccessorListTy(Successors.data(), 1);
+  }
 };
 
 /// YieldInst - Yield control temporarily to the caller of this coroutine.
@@ -8321,14 +8510,11 @@ public:
 /// representing a bundle of the original function and the transpose function,
 /// extract the specified function.
 class LinearFunctionExtractInst
-    : public InstructionBase<
-          SILInstructionKind::LinearFunctionExtractInst,
-          SingleValueInstruction> {
+    : public UnaryInstructionBase<SILInstructionKind::LinearFunctionExtractInst,
+                                  SingleValueInstruction> {
 private:
   /// The extractee.
   LinearDifferentiableFunctionTypeComponent extractee;
-  /// The list containing the `@differentiable(linear)` function operand.
-  FixedOperandList<1> operands;
 
   static SILType
   getExtracteeType(SILValue function,
@@ -8344,10 +8530,6 @@ public:
   LinearDifferentiableFunctionTypeComponent getExtractee() const {
     return extractee;
   }
-
-  SILValue getFunctionOperand() const { return operands[0].get(); }
-  ArrayRef<Operand> getAllOperands() const { return operands.asArray(); }
-  MutableArrayRef<Operand> getAllOperands() { return operands.asArray(); }
 };
 
 /// DifferentiabilityWitnessFunctionInst - Looks up a differentiability witness

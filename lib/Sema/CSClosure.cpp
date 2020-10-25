@@ -16,7 +16,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "ConstraintSystem.h"
+#include "TypeChecker.h"
+#include "swift/Sema/ConstraintSystem.h"
+
 using namespace swift;
 using namespace swift::constraints;
 
@@ -311,11 +313,11 @@ SolutionApplicationToFunctionResult ConstraintSystem::applySolution(
   // transformations.
   llvm::SaveAndRestore<DeclContext *> savedDC(currentDC, fn.getAsDeclContext());
 
-  // Apply the function builder transform, if there is one.
+  // Apply the result builder transform, if there is one.
   if (auto transform = solution.getAppliedBuilderTransform(fn)) {
-    // Apply the function builder to the closure. We want to be in the
+    // Apply the result builder to the closure. We want to be in the
     // context of the closure for subsequent transforms.
-    auto newBody = applyFunctionBuilderTransform(
+    auto newBody = applyResultBuilderTransform(
         solution, *transform, fn.getBody(), fn.getAsDeclContext(),
         [&](SolutionApplicationTarget target) {
           auto resultTarget = rewriteTarget(target);
@@ -329,7 +331,7 @@ SolutionApplicationToFunctionResult ConstraintSystem::applySolution(
     if (!newBody)
       return SolutionApplicationToFunctionResult::Failure;
 
-    fn.setBody(newBody, /*isSingleExpression=*/false);
+    fn.setTypecheckedBody(newBody, /*isSingleExpression=*/false);
     if (closure) {
       solution.setExprTypes(closure);
     }
@@ -345,11 +347,13 @@ SolutionApplicationToFunctionResult ConstraintSystem::applySolution(
     ClosureConstraintApplication application(
         solution, closure, closureFnType->getResult(), rewriteTarget);
     application.visit(fn.getBody());
+    closure->setBodyState(ClosureExpr::BodyState::TypeCheckedWithSignature);
 
     return SolutionApplicationToFunctionResult::Success;
   }
 
   // Otherwise, we need to delay type checking of the closure until later.
   solution.setExprTypes(closure);
+  closure->setBodyState(ClosureExpr::BodyState::ReadyForTypeChecking);
   return SolutionApplicationToFunctionResult::Delay;
 }

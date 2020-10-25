@@ -189,6 +189,7 @@ def _apply_default_arguments(args):
         args.test_indexstoredb = False
         args.test_sourcekitlsp = False
         args.test_skstresstester = False
+        args.test_swiftformat = False
         args.test_swiftevolve = False
         args.test_toolchainbenchmarks = False
 
@@ -386,6 +387,9 @@ def create_argument_parser():
     option('--distcc', toggle_true,
            default=os.environ.get('USE_DISTCC') == '1',
            help='use distcc in pump mode')
+    option('--sccache', toggle_true,
+           default=os.environ.get('SWIFT_USE_SCCACHE') == '1',
+           help='use sccache')
     option('--enable-asan', toggle_true,
            help='enable Address Sanitizer')
     option('--enable-ubsan', toggle_true,
@@ -548,16 +552,16 @@ def create_argument_parser():
     # -------------------------------------------------------------------------
     in_group('Options to select projects')
 
-    option('--infer', store_true('infer_dependencies'),
+    option('--infer', toggle_true('infer_dependencies'),
            help='Infer any downstream dependencies from enabled projects')
 
-    option(['-l', '--lldb'], store_true('build_lldb'),
+    option(['-l', '--lldb'], toggle_true('build_lldb'),
            help='build LLDB')
 
-    option(['-b', '--llbuild'], store_true('build_llbuild'),
+    option(['-b', '--llbuild'], toggle_true('build_llbuild'),
            help='build llbuild')
 
-    option(['--libcxx'], store_true('build_libcxx'),
+    option(['--libcxx'], toggle_true('build_libcxx'),
            help='build libcxx')
 
     option(['-p', '--swiftpm'], toggle_true('build_swiftpm'),
@@ -566,13 +570,16 @@ def create_argument_parser():
     option(['--install-swiftpm'], toggle_true('install_swiftpm'),
            help='install swiftpm')
 
-    option(['--swiftsyntax'], store_true('build_swiftsyntax'),
+    option(['--swiftsyntax'], toggle_true('build_swiftsyntax'),
            help='build swiftSyntax')
 
-    option(['--skstresstester'], store_true('build_skstresstester'),
+    option(['--skstresstester'], toggle_true('build_skstresstester'),
            help='build the SourceKit stress tester')
 
-    option(['--swiftevolve'], store_true('build_swiftevolve'),
+    option(['--swiftformat'], toggle_true('build_swiftformat'),
+           help='build swift-format')
+
+    option(['--swiftevolve'], toggle_true('build_swiftevolve'),
            help='build the swift-evolve tool')
 
     option(['--swift-driver'], toggle_true('build_swift_driver'),
@@ -593,9 +600,7 @@ def create_argument_parser():
     option('--swiftsyntax-verify-generated-files',
            toggle_true('swiftsyntax_verify_generated_files'),
            help='set to verify that the generated files in the source tree '
-                'match the ones that would be generated from current master')
-    option(['--install-pythonkit'], toggle_true('install_pythonkit'),
-           help='install PythonKit')
+                'match the ones that would be generated from current main')
     option(['--install-sourcekit-lsp'], toggle_true('install_sourcekitlsp'),
            help='install SourceKitLSP')
     option(['--install-skstresstester'], toggle_true('install_skstresstester'),
@@ -628,22 +633,13 @@ def create_argument_parser():
     option('--playgroundsupport', toggle_true('build_playgroundsupport'),
            help='build PlaygroundSupport')
     option('--install-playgroundsupport',
-           store_true('install_playgroundsupport'),
+           toggle_true('install_playgroundsupport'),
            help='install playground support')
-
-    option('--pythonkit', store_true('build_pythonkit'),
-           help='build PythonKit')
-
-    option('--tensorflow-swift-apis', store_true('build_tensorflow_swift_apis'),
-           help='build TensorFlow Swift APIs')
-    option('--install-tensorflow-swift-apis',
-           store_true('install_tensorflow_swift_apis'),
-           help='install TensorFlow Swift APIs')
 
     option('--build-ninja', toggle_true,
            help='build the Ninja tool')
 
-    option(['--build-libparser-only'], store_true('build_libparser_only'),
+    option(['--build-libparser-only'], toggle_true('build_libparser_only'),
            help='build only libParser for SwiftSyntax')
 
     option('--skip-build-clang-tools-extra',
@@ -685,6 +681,11 @@ def create_argument_parser():
         option(['-R', '--release'], store('build_variant'),
                const='Release',
                help='build the Release variant of everything (default is '
+                    '%(default)s)')
+
+        option(['--min-size-release'], store('build_variant'),
+               const='MinSizeRel',
+               help='build the MinSizeRel variant of everything (default is '
                     '%(default)s)')
 
     # -------------------------------------------------------------------------
@@ -891,9 +892,6 @@ def create_argument_parser():
     option('--skip-test-cygwin', toggle_false('test_cygwin'),
            help='skip testing Swift stdlibs for Cygwin')
 
-    option('--test-pythonkit', toggle_true('test_pythonkit'),
-           help='skip testing PythonKit')
-
     # -------------------------------------------------------------------------
     in_group('Run build')
 
@@ -1013,6 +1011,10 @@ def create_argument_parser():
            help='skip testing Android device targets on the host machine (the '
                 'phone itself)')
 
+    option('--skip-clean-swiftpm', toggle_false('clean_swiftpm'),
+           help='skip cleaning up swiftpm')
+    option('--skip-clean-swift-driver', toggle_false('clean_swift_driver'),
+           help='skip cleaning up Swift driver')
     option('--skip-test-swiftpm', toggle_false('test_swiftpm'),
            help='skip testing swiftpm')
     option('--skip-test-swift-driver', toggle_false('test_swift_driver'),
@@ -1028,6 +1030,8 @@ def create_argument_parser():
            help='skip testing PlaygroundSupport')
     option('--skip-test-skstresstester', toggle_false('test_skstresstester'),
            help='skip testing the SourceKit Stress tester')
+    option('--skip-test-swiftformat', toggle_false('test_swiftformat'),
+           help='skip testing swift-format')
     option('--skip-test-swiftevolve', toggle_false('test_swiftevolve'),
            help='skip testing SwiftEvolve')
     option('--skip-test-toolchain-benchmarks',
@@ -1096,6 +1100,10 @@ def create_argument_parser():
            default=True,
            help='Enable experimental Swift differentiable programming language'
                 ' features.')
+
+    option('--enable-experimental-concurrency', toggle_true,
+           default=True,
+           help='Enable experimental Swift concurrency model.')
 
     # -------------------------------------------------------------------------
     in_group('Unsupported options')
@@ -1185,16 +1193,13 @@ SWIFT_SOURCE_ROOT: a directory containing the source for LLVM, Clang, Swift.
 
 'build-script' expects the sources to be laid out in the following way:
 
-   $SWIFT_SOURCE_ROOT/llvm
-                     /clang
+   $SWIFT_SOURCE_ROOT/llvm-project
                      /swift
-                     /lldb                       (optional)
                      /llbuild                    (optional)
                      /swiftpm                    (optional, requires llbuild)
                      /swift-syntax               (optional, requires swiftpm)
                      /swift-stress-tester        (optional,
                                                    requires swift-syntax)
-                     /compiler-rt                (optional)
                      /swift-corelibs-xctest      (optional)
                      /swift-corelibs-foundation  (optional)
                      /swift-corelibs-libdispatch (optional)

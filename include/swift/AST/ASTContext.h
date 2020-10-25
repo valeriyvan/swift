@@ -20,13 +20,15 @@
 #include "swift/AST/Evaluator.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Identifier.h"
+#include "swift/AST/Import.h"
 #include "swift/AST/SearchPathOptions.h"
 #include "swift/AST/Type.h"
-#include "swift/AST/Types.h"
 #include "swift/AST/TypeAlignments.h"
+#include "swift/AST/Types.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/Located.h"
 #include "swift/Basic/Malloc.h"
+#include "clang/AST/DeclTemplate.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
@@ -62,6 +64,7 @@ namespace swift {
   class BoundGenericType;
   class ClangModuleLoader;
   class ClangNode;
+  class ClangTypeConverter;
   class ConcreteDeclRef;
   class ConstructorDecl;
   class Decl;
@@ -121,6 +124,7 @@ namespace swift {
   class IndexSubset;
   struct SILAutoDiffDerivativeFunctionKey;
   struct InterfaceSubContextDelegate;
+  class TypeCheckCompletionCallback;
 
   enum class KnownProtocolKind : uint8_t;
 
@@ -196,6 +200,16 @@ public:
 
 class SILLayout; // From SIL
 
+/// A set of missing witnesses for a given conformance. These are temporarily
+/// stashed in the ASTContext so the type checker can get at them.
+///
+/// The only subclass is owned by the type checker, so it can hide its own
+/// data structures.
+class MissingWitnessesBase {
+public:
+  virtual ~MissingWitnessesBase();
+};
+
 /// ASTContext - This object creates and owns the AST objects.
 /// However, this class does more than just maintain context within an AST.
 /// It is the closest thing to thread-local or compile-local storage in this
@@ -213,7 +227,9 @@ class ASTContext final {
   void operator=(const ASTContext&) = delete;
 
   ASTContext(LangOptions &langOpts, TypeCheckerOptions &typeckOpts,
-             SearchPathOptions &SearchPathOpts, SourceManager &SourceMgr,
+             SearchPathOptions &SearchPathOpts,
+             ClangImporterOptions &ClangImporterOpts,
+             SourceManager &SourceMgr,
              DiagnosticEngine &Diags);
 
 public:
@@ -227,6 +243,7 @@ public:
 
   static ASTContext *get(LangOptions &langOpts, TypeCheckerOptions &typeckOpts,
                          SearchPathOptions &SearchPathOpts,
+                         ClangImporterOptions &ClangImporterOpts,
                          SourceManager &SourceMgr, DiagnosticEngine &Diags);
   ~ASTContext();
 
@@ -245,11 +262,16 @@ public:
   /// The search path options used by this AST context.
   SearchPathOptions &SearchPathOpts;
 
+  /// The clang importer options used by this AST context.
+  ClangImporterOptions &ClangImporterOpts;
+
   /// The source manager object.
   SourceManager &SourceMgr;
 
   /// Diags - The diagnostics engine.
   DiagnosticEngine &Diags;
+
+  TypeCheckCompletionCallback *CompletionCallback = nullptr;
 
   /// The request-evaluator that is used to process various requests.
   Evaluator evaluator;
@@ -478,13 +500,13 @@ public:
   /// Retrieve the type Swift.Never.
   CanType getNeverType() const;
 
-#define KNOWN_OBJC_TYPE_DECL(MODULE, NAME, DECL_CLASS) \
+#define KNOWN_SDK_TYPE_DECL(MODULE, NAME, DECL_CLASS, NUM_GENERIC_PARAMS) \
   /** Retrieve the declaration of MODULE.NAME. */ \
   DECL_CLASS *get##NAME##Decl() const; \
 \
   /** Retrieve the type of MODULE.NAME. */ \
   Type get##NAME##Type() const;
-#include "swift/AST/KnownObjCTypes.def"
+#include "swift/AST/KnownSDKTypes.def"
 
   // Declare accessors for the known declarations.
 #define FUNC_DECL(Name, Id) \
@@ -553,6 +575,9 @@ public:
   /// Array.reserveCapacityForAppend(newElementsCount: Int)
   FuncDecl *getArrayReserveCapacityDecl() const;
 
+  /// Retrieve the declaration of String.init(_builtinStringLiteral ...)
+  ConstructorDecl *getMakeUTF8StringDecl() const;
+
   // Retrieve the declaration of Swift._stdlib_isOSVersionAtLeast.
   FuncDecl *getIsOSVersionAtLeastDecl() const;
   
@@ -583,18 +608,33 @@ public:
   Type getBridgedToObjC(const DeclContext *dc, Type type,
                         Type *bridgedValueType = nullptr) const;
 
+private:
+  ClangTypeConverter &getClangTypeConverter();
+
+public:
   /// Get the Clang type corresponding to a Swift function type.
   ///
   /// \param params The function parameters.
   /// \param resultTy The Swift result type.
-  /// \param incompleteExtInfo Used to convey escaping and throwing
-  ///                          information, in case it is needed.
   /// \param trueRep The actual calling convention, which must be C-compatible.
-  ///                The calling convention in \p incompleteExtInfo is ignored.
   const clang::Type *
   getClangFunctionType(ArrayRef<AnyFunctionType::Param> params, Type resultTy,
-                       const FunctionType::ExtInfo incompleteExtInfo,
                        FunctionTypeRepresentation trueRep);
+
+  /// Get the canonical Clang type corresponding to a SIL function type.
+  ///
+  /// SIL analog of \c ASTContext::getClangFunctionType .
+  const clang::Type *
+  getCanonicalClangFunctionType(
+    ArrayRef<SILParameterInfo> params, Optional<SILResultInfo> result,
+    SILFunctionType::Representation trueRep);
+
+  /// Instantiates "Impl.Converter" if needed, then calls
+  /// ClangTypeConverter::getClangTemplateArguments.
+  std::unique_ptr<TemplateInstantiationError> getClangTemplateArguments(
+      const clang::TemplateParameterList *templateParams,
+      ArrayRef<Type> genericArgs,
+      SmallVectorImpl<clang::TemplateArgument> &templateArgs);
 
   /// Get the Swift declaration that a Clang declaration was exported from,
   /// if applicable.
@@ -649,6 +689,22 @@ public:
   /// metadata.
   AvailabilityContext getPrespecializedGenericMetadataAvailability();
 
+  /// Get the runtime availability of the swift_compareTypeContextDescriptors
+  /// for the target platform.
+  AvailabilityContext getCompareTypeContextDescriptorsAvailability();
+
+  /// Get the runtime availability of the
+  /// swift_compareProtocolConformanceDescriptors entry point for the target
+  /// platform.
+  AvailabilityContext getCompareProtocolConformanceDescriptorsAvailability();
+
+  /// Get the runtime availability of support for inter-module prespecialized
+  /// generic metadata.
+  AvailabilityContext getIntermodulePrespecializedGenericMetadataAvailability();
+
+  /// Get the runtime availability of support for concurrency.
+  AvailabilityContext getConcurrencyAvailability();
+
   /// Get the runtime availability of features introduced in the Swift 5.2
   /// compiler for the target platform.
   AvailabilityContext getSwift52Availability();
@@ -656,6 +712,10 @@ public:
   /// Get the runtime availability of features introduced in the Swift 5.3
   /// compiler for the target platform.
   AvailabilityContext getSwift53Availability();
+
+  /// Get the runtime availability of features introduced in the Swift 5.4
+  /// compiler for the target platform.
+  AvailabilityContext getSwift54Availability();
 
   /// Get the runtime availability of features that have been introduced in the
   /// Swift compiler for future versions of the target platform.
@@ -707,8 +767,17 @@ public:
   ///                compiler.
   /// \param isDWARF \c true if this module loader can load Clang modules
   ///                from DWARF.
+  /// \param IsInterface \c true if this module loader can load Swift textual
+  ///                interface.
   void addModuleLoader(std::unique_ptr<ModuleLoader> loader,
-                       bool isClang = false, bool isDWARF = false);
+                       bool isClang = false, bool isDWARF = false,
+                       bool IsInterface = false);
+
+  /// Add a module interface checker to use for this AST context.
+  void addModuleInterfaceChecker(std::unique_ptr<ModuleInterfaceChecker> checker);
+
+  /// Retrieve the module interface checker associated with this AST context.
+  ModuleInterfaceChecker *getModuleInterfaceChecker() const;
 
   /// Retrieve the module dependencies for the module with the given name.
   ///
@@ -717,6 +786,12 @@ public:
   Optional<ModuleDependencies> getModuleDependencies(
       StringRef moduleName,
       bool isUnderlyingClangModule,
+      ModuleDependenciesCache &cache,
+      InterfaceSubContextDelegate &delegate);
+
+  /// Retrieve the module dependencies for the Swift module with the given name.
+  Optional<ModuleDependencies> getSwiftModuleDependencies(
+      StringRef moduleName,
       ModuleDependenciesCache &cache,
       InterfaceSubContextDelegate &delegate);
 
@@ -781,7 +856,6 @@ public:
   /// If there is no Clang module loader, returns a null pointer.
   /// The loader is owned by the AST context.
   ClangModuleLoader *getDWARFModuleLoader() const;
-
 public:
   namelookup::ImportCache &getImportCache() const;
 
@@ -810,12 +884,12 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  bool canImportModule(Located<Identifier> ModulePath);
+  bool canImportModule(ImportPath::Element ModulePath);
 
   /// \returns a module with a given name that was already loaded.  If the
   /// module was not loaded, returns nullptr.
   ModuleDecl *getLoadedModule(
-      ArrayRef<Located<Identifier>> ModulePath) const;
+      ImportPath::Module ModulePath) const;
 
   ModuleDecl *getLoadedModule(Identifier ModuleName) const;
 
@@ -825,9 +899,11 @@ public:
   /// be returned.
   ///
   /// \returns The requested module, or NULL if the module cannot be found.
-  ModuleDecl *getModule(ArrayRef<Located<Identifier>> ModulePath);
+  ModuleDecl *getModule(ImportPath::Module ModulePath);
 
   ModuleDecl *getModuleByName(StringRef ModuleName);
+
+  ModuleDecl *getModuleByIdentifier(Identifier ModuleID);
 
   /// Returns the standard library module, or null if the library isn't present.
   ///
@@ -897,12 +973,13 @@ public:
   takeDelayedConformanceDiags(NormalProtocolConformance *conformance);
 
   /// Add delayed missing witnesses for the given normal protocol conformance.
-  void addDelayedMissingWitnesses(NormalProtocolConformance *conformance,
-                                  ArrayRef<ValueDecl*> witnesses);
+  void addDelayedMissingWitnesses(
+      NormalProtocolConformance *conformance,
+      std::unique_ptr<MissingWitnessesBase> missingWitnesses);
 
   /// Retrieve the delayed missing witnesses for the given normal protocol
   /// conformance.
-  std::vector<ValueDecl*>
+  std::unique_ptr<MissingWitnessesBase>
   takeDelayedMissingWitnesses(NormalProtocolConformance *conformance);
 
   /// Produce a specialized conformance, which takes a generic
@@ -1002,9 +1079,8 @@ public:
   CanGenericSignature getSingleGenericParameterSignature() const;
 
   /// Retrieve a generic signature with a single type parameter conforming
-  /// to the given opened archetype.
-  CanGenericSignature getOpenedArchetypeSignature(CanType existential,
-                                                  ModuleDecl *mod);
+  /// to the given protocol or composition type, like <T: type>.
+  CanGenericSignature getOpenedArchetypeSignature(Type type);
 
   GenericSignature getOverrideGenericSignature(const ValueDecl *base,
                                                const ValueDecl *derived);

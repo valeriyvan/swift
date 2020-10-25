@@ -84,7 +84,7 @@ static void buildTypeDependentOperands(
     TypeDependentOperands.push_back(Def);
   }
   if (hasDynamicSelf)
-    TypeDependentOperands.push_back(F.getSelfMetadataArgument());
+    TypeDependentOperands.push_back(F.getDynamicSelfMetadata());
 }
 
 // Collects all opened archetypes from a type and a substitutions list and form
@@ -762,10 +762,10 @@ getExtracteeType(
 
 LinearFunctionExtractInst::LinearFunctionExtractInst(
     SILModule &module, SILDebugLocation debugLoc,
-    LinearDifferentiableFunctionTypeComponent extractee, SILValue theFunction)
-    : InstructionBase(debugLoc,
-                      getExtracteeType(theFunction, extractee, module)),
-      extractee(extractee), operands(this, theFunction) {}
+    LinearDifferentiableFunctionTypeComponent extractee, SILValue function)
+    : UnaryInstructionBase(debugLoc, function,
+                           getExtracteeType(function, extractee, module)),
+      extractee(extractee) {}
 
 SILType DifferentiabilityWitnessFunctionInst::getDifferentiabilityWitnessType(
     SILModule &module, DifferentiabilityWitnessFunctionKind witnessKind,
@@ -1043,9 +1043,6 @@ CondFailInst *CondFailInst::create(SILDebugLocation DebugLoc, SILValue Operand,
 }
 
 uint64_t StringLiteralInst::getCodeUnitCount() {
-  auto E = unsigned(Encoding::UTF16);
-  if (SILInstruction::Bits.StringLiteralInst.TheEncoding == E)
-    return unicode::getUTF16Length(getValue());
   return SILInstruction::Bits.StringLiteralInst.Length;
 }
 
@@ -1261,7 +1258,7 @@ bool TupleExtractInst::isTrivialEltOfOneRCIDTuple() const {
   // parent tuple has only one non-trivial field.
   bool FoundNonTrivialField = false;
   SILType OpTy = getOperand()->getType();
-  unsigned FieldNo = getFieldNo();
+  unsigned FieldNo = getFieldIndex();
 
   // For each element index of the tuple...
   for (unsigned i = 0, e = getNumTupleElts(); i != e; ++i) {
@@ -1303,7 +1300,7 @@ bool TupleExtractInst::isEltOnlyNonTrivialElt() const {
   // Ok, we know that the elt we are extracting is non-trivial. Make sure that
   // we have no other non-trivial elts.
   SILType OpTy = getOperand()->getType();
-  unsigned FieldNo = getFieldNo();
+  unsigned FieldNo = getFieldIndex();
 
   // For each element index of the tuple...
   for (unsigned i = 0, e = getNumTupleElts(); i != e; ++i) {
@@ -1326,18 +1323,51 @@ bool TupleExtractInst::isEltOnlyNonTrivialElt() const {
   return true;
 }
 
-unsigned FieldIndexCacheBase::cacheFieldIndex() {
-  unsigned i = 0;
-  for (VarDecl *property : getParentDecl()->getStoredProperties()) {
-    if (field == property) {
-      SILInstruction::Bits.FieldIndexCacheBase.FieldIndex = i;
-      return i;
+/// Get a unique index for a struct or class field in layout order.
+unsigned swift::getFieldIndex(NominalTypeDecl *decl, VarDecl *field) {
+  unsigned index = 0;
+  if (auto *classDecl = dyn_cast<ClassDecl>(decl)) {
+    for (auto *superDecl = classDecl->getSuperclassDecl(); superDecl != nullptr;
+         superDecl = superDecl->getSuperclassDecl()) {
+      index += superDecl->getStoredProperties().size();
     }
-    ++i;
+  }
+  for (VarDecl *property : decl->getStoredProperties()) {
+    if (field == property) {
+      return index;
+    }
+    ++index;
   }
   llvm_unreachable("The field decl for a struct_extract, struct_element_addr, "
-                   "or ref_element_addr must be an accessible stored property "
-                   "of the operand's type");
+                   "or ref_element_addr must be an accessible stored "
+                   "property of the operand type");
+}
+
+/// Get the property for a struct or class by its unique index.
+VarDecl *swift::getIndexedField(NominalTypeDecl *decl, unsigned index) {
+  if (auto *structDecl = dyn_cast<StructDecl>(decl)) {
+    return structDecl->getStoredProperties()[index];
+  }
+  auto *classDecl = cast<ClassDecl>(decl);
+  SmallVector<ClassDecl *, 3> superclasses;
+  for (auto *superDecl = classDecl; superDecl != nullptr;
+       superDecl = superDecl->getSuperclassDecl()) {
+    superclasses.push_back(superDecl);
+  }
+  std::reverse(superclasses.begin(), superclasses.end());
+  for (auto *superDecl : superclasses) {
+    if (index < superDecl->getStoredProperties().size()) {
+      return superDecl->getStoredProperties()[index];
+    }
+    index -= superDecl->getStoredProperties().size();
+  }
+  return nullptr;
+}
+
+unsigned FieldIndexCacheBase::cacheFieldIndex() {
+  unsigned index = ::getFieldIndex(getParentDecl(), getField());
+  SILInstruction::Bits.FieldIndexCacheBase.FieldIndex = index;
+  return index;
 }
 
 // FIXME: this should be cached during cacheFieldIndex().
@@ -1444,6 +1474,7 @@ TermInst::SuccessorListTy TermInst::getSuccessors() {
 
 bool TermInst::isFunctionExiting() const {
   switch (getTermKind()) {
+  case TermKind::AwaitAsyncContinuationInst:
   case TermKind::BranchInst:
   case TermKind::CondBranchInst:
   case TermKind::SwitchValueInst:
@@ -1468,6 +1499,7 @@ bool TermInst::isFunctionExiting() const {
 
 bool TermInst::isProgramTerminating() const {
   switch (getTermKind()) {
+  case TermKind::AwaitAsyncContinuationInst:
   case TermKind::BranchInst:
   case TermKind::CondBranchInst:
   case TermKind::SwitchValueInst:
@@ -2217,6 +2249,21 @@ UncheckedRefCastInst::create(SILDebugLocation DebugLoc, SILValue Operand,
                                              TypeDependentOperands, Ty);
 }
 
+UncheckedValueCastInst *
+UncheckedValueCastInst::create(SILDebugLocation DebugLoc, SILValue Operand,
+                               SILType Ty, SILFunction &F,
+                               SILOpenedArchetypesState &OpenedArchetypes) {
+  SILModule &Mod = F.getModule();
+  SmallVector<SILValue, 8> TypeDependentOperands;
+  collectTypeDependentOperands(TypeDependentOperands, OpenedArchetypes, F,
+                               Ty.getASTType());
+  unsigned size =
+      totalSizeToAlloc<swift::Operand>(1 + TypeDependentOperands.size());
+  void *Buffer = Mod.allocateInst(size, alignof(UncheckedValueCastInst));
+  return ::new (Buffer)
+      UncheckedValueCastInst(DebugLoc, Operand, TypeDependentOperands, Ty);
+}
+
 UncheckedAddrCastInst *
 UncheckedAddrCastInst::create(SILDebugLocation DebugLoc, SILValue Operand,
                               SILType Ty, SILFunction &F,
@@ -2882,4 +2929,24 @@ DestructureTupleInst *DestructureTupleInst::create(const SILFunction &F,
 
   return ::new (Buffer)
       DestructureTupleInst(M, Loc, Operand, Types, OwnershipKinds);
+}
+
+CanType GetAsyncContinuationInstBase::getFormalResumeType() const {
+  // The resume type is the type argument to the continuation type.
+  return getType().castTo<BoundGenericType>().getGenericArgs()[0];
+}
+
+SILType GetAsyncContinuationInstBase::getLoweredResumeType() const {
+  // The lowered resume type is the maximally-abstracted lowering of the
+  // formal resume type.
+  auto formalType = getFormalResumeType();
+  auto &M = getFunction()->getModule();
+  auto c = getFunction()->getTypeExpansionContext();
+  return M.Types.getLoweredType(AbstractionPattern::getOpaque(), formalType, c);
+}
+
+bool GetAsyncContinuationInstBase::throws() const {
+  // The continuation throws if it's an UnsafeThrowingContinuation
+  return getType().castTo<BoundGenericType>()->getDecl()
+    == getFunction()->getASTContext().getUnsafeThrowingContinuationDecl();
 }

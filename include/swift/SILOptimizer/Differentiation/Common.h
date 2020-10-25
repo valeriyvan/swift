@@ -17,6 +17,8 @@
 #ifndef SWIFT_SILOPTIMIZER_UTILS_DIFFERENTIATION_COMMON_H
 #define SWIFT_SILOPTIMIZER_UTILS_DIFFERENTIATION_COMMON_H
 
+#include "swift/AST/DiagnosticsSIL.h"
+#include "swift/AST/Expr.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/SIL/SILDifferentiabilityWitness.h"
 #include "swift/SIL/SILFunction.h"
@@ -24,14 +26,17 @@
 #include "swift/SIL/TypeSubstCloner.h"
 #include "swift/SILOptimizer/Analysis/ArraySemantic.h"
 #include "swift/SILOptimizer/Analysis/DifferentiableActivityAnalysis.h"
+#include "swift/SILOptimizer/Differentiation/DifferentiationInvoker.h"
 
 namespace swift {
+
+namespace autodiff {
+
+class ADContext;
 
 //===----------------------------------------------------------------------===//
 // Helpers
 //===----------------------------------------------------------------------===//
-
-namespace autodiff {
 
 /// Prints an "[AD] " prefix to `llvm::dbgs()` and returns the debug stream.
 /// This is being used to print short debug messages within the AD pass.
@@ -137,6 +142,36 @@ template <class Inst> Inst *peerThroughFunctionConversions(SILValue value) {
 }
 
 //===----------------------------------------------------------------------===//
+// Diagnostic utilities
+//===----------------------------------------------------------------------===//
+
+// Returns `v`'s location if it is valid. Otherwise, returns `v`'s function's
+// location as as a fallback. Used for diagnostics.
+SILLocation getValidLocation(SILValue v);
+
+// Returns `inst`'s location if it is valid. Otherwise, returns `inst`'s
+// function's location as as a fallback. Used for diagnostics.
+SILLocation getValidLocation(SILInstruction *inst);
+
+//===----------------------------------------------------------------------===//
+// Tangent property lookup utilities
+//===----------------------------------------------------------------------===//
+
+/// Returns the tangent stored property of the given original stored property
+/// and base type. On error, emits diagnostic and returns nullptr.
+VarDecl *getTangentStoredProperty(ADContext &context, VarDecl *originalField,
+                                  CanType baseType, SILLocation loc,
+                                  DifferentiationInvoker invoker);
+
+/// Returns the tangent stored property of the original stored property
+/// referenced by the given projection instruction with the given base type.
+/// On error, emits diagnostic and returns nullptr.
+VarDecl *getTangentStoredProperty(ADContext &context,
+                                  FieldIndexCacheBase *projectionInst,
+                                  CanType baseType,
+                                  DifferentiationInvoker invoker);
+
+//===----------------------------------------------------------------------===//
 // Code emission utilities
 //===----------------------------------------------------------------------===//
 
@@ -235,59 +270,6 @@ inline void createEntryArguments(SILFunction *f) {
     createFunctionArgument(f->mapTypeIntoContext(paramTy));
   }
 }
-
-/// Helper class for visiting basic blocks in post-order post-dominance order,
-/// based on a worklist algorithm.
-class PostOrderPostDominanceOrder {
-  SmallVector<DominanceInfoNode *, 16> buffer;
-  PostOrderFunctionInfo *postOrderInfo;
-  size_t srcIdx = 0;
-
-public:
-  /// Constructor.
-  /// \p root The root of the post-dominator tree.
-  /// \p postOrderInfo The post-order info of the function.
-  /// \p capacity Should be the number of basic blocks in the dominator tree to
-  ///             reduce memory allocation.
-  PostOrderPostDominanceOrder(DominanceInfoNode *root,
-                              PostOrderFunctionInfo *postOrderInfo,
-                              int capacity = 0)
-      : postOrderInfo(postOrderInfo) {
-    buffer.reserve(capacity);
-    buffer.push_back(root);
-  }
-
-  /// Get the next block from the worklist.
-  DominanceInfoNode *getNext() {
-    if (srcIdx == buffer.size())
-      return nullptr;
-    return buffer[srcIdx++];
-  }
-
-  /// Pushes the dominator children of a block onto the worklist in post-order.
-  void pushChildren(DominanceInfoNode *node) {
-    pushChildrenIf(node, [](SILBasicBlock *) { return true; });
-  }
-
-  /// Conditionally pushes the dominator children of a block onto the worklist
-  /// in post-order.
-  template <typename Pred>
-  void pushChildrenIf(DominanceInfoNode *node, Pred pred) {
-    SmallVector<DominanceInfoNode *, 4> children;
-    for (auto *child : *node)
-      children.push_back(child);
-    llvm::sort(children.begin(), children.end(),
-               [&](DominanceInfoNode *n1, DominanceInfoNode *n2) {
-                 return postOrderInfo->getPONumber(n1->getBlock()) <
-                        postOrderInfo->getPONumber(n2->getBlock());
-               });
-    for (auto *child : children) {
-      SILBasicBlock *childBB = child->getBlock();
-      if (pred(childBB))
-        buffer.push_back(child);
-    }
-  }
-};
 
 /// Cloner that remaps types using the target function's generic environment.
 class BasicTypeSubstCloner final

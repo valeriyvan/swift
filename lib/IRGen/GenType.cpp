@@ -1216,7 +1216,7 @@ TypeConverter::createPrimitiveForAlignedPointer(llvm::PointerType *type,
                                                 Alignment align,
                                                 Alignment pointerAlignment) {
   SpareBitVector spareBits = IGM.TargetInfo.PointerSpareBits;
-  for (unsigned bit = 0; Alignment(1 << bit) != pointerAlignment; ++bit) {
+  for (unsigned bit = 0; Alignment(1ull << bit) != pointerAlignment; ++bit) {
     spareBits.setBit(bit);
   }
 
@@ -1355,23 +1355,7 @@ TypeConverter::TypeConverter(IRGenModule &IGM)
     if (!doesPlatformUseLegacyLayouts(platformName, archName))
       return;
 
-    // Find the first runtime library path that exists.
-    bool found = false;
-    for (auto &RuntimeLibraryPath
-         : IGM.Context.SearchPathOpts.RuntimeLibraryPaths) {
-      if (fs->exists(RuntimeLibraryPath)) {
-        defaultPath.append(RuntimeLibraryPath);
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      auto joined = llvm::join(IGM.Context.SearchPathOpts.RuntimeLibraryPaths,
-                               "', '");
-      llvm::report_fatal_error("Unable to find a runtime library path at '"
-                               + joined + "'");
-    }
-
+    defaultPath = IGM.Context.SearchPathOpts.RuntimeLibraryPaths[0];
     llvm::sys::path::append(defaultPath, "layouts-");
     defaultPath.append(archName);
     defaultPath.append(".yaml");
@@ -1888,7 +1872,7 @@ convertPrimitiveBuiltin(IRGenModule &IGM, CanType canTy) {
       = convertPrimitiveBuiltin(IGM,
                                 vecTy->getElementType()->getCanonicalType());
 
-    auto llvmVecTy = llvm::VectorType::get(elementTy, vecTy->getNumElements());
+    auto llvmVecTy = llvm::FixedVectorType::get(elementTy, vecTy->getNumElements());
     unsigned bitSize = size.getValue() * vecTy->getNumElements() * 8;
     if (!llvm::isPowerOf2_32(bitSize))
       bitSize = llvm::NextPowerOf2(bitSize);
@@ -2397,16 +2381,16 @@ unsigned IRGenModule::getBuiltinIntegerWidth(BuiltinIntegerWidth w) {
   llvm_unreachable("impossible width value");
 }
 
-void IRGenFunction::setLocalSelfMetadata(CanType selfClass,
-                                         bool isExactSelfClass,
-                                         llvm::Value *value,
-                                         IRGenFunction::LocalSelfKind kind) {
-  assert(!LocalSelf && "already have local self metadata");
-  LocalSelf = value;
+void IRGenFunction::setDynamicSelfMetadata(CanType selfClass,
+                                           bool isExactSelfClass,
+                                           llvm::Value *value,
+                                           IRGenFunction::DynamicSelfKind kind) {
+  assert(!SelfValue && "already have local self metadata");
+  SelfValue = value;
   assert(selfClass->getClassOrBoundGenericClass()
          && "self type not a class?");
-  LocalSelfIsExact = isExactSelfClass;
-  LocalSelfType = selfClass;
+  SelfTypeIsExact = isExactSelfClass;
+  SelfType = selfClass;
   SelfKind = kind;
 }
 

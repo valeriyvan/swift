@@ -103,6 +103,7 @@ CONSTANT_OWNERSHIP_INST(None, FunctionRef)
 CONSTANT_OWNERSHIP_INST(None, DynamicFunctionRef)
 CONSTANT_OWNERSHIP_INST(None, PreviousDynamicFunctionRef)
 CONSTANT_OWNERSHIP_INST(None, GlobalAddr)
+CONSTANT_OWNERSHIP_INST(None, BaseAddrForOffset)
 CONSTANT_OWNERSHIP_INST(None, IndexAddr)
 CONSTANT_OWNERSHIP_INST(None, IndexRawPointer)
 CONSTANT_OWNERSHIP_INST(None, InitEnumDataAddr)
@@ -147,6 +148,9 @@ CONSTANT_OWNERSHIP_INST(None, DifferentiabilityWitnessFunction)
 CONSTANT_OWNERSHIP_INST(Unowned, RawPointerToRef)
 CONSTANT_OWNERSHIP_INST(Unowned, ObjCProtocol)
 CONSTANT_OWNERSHIP_INST(Unowned, ValueToBridgeObject)
+CONSTANT_OWNERSHIP_INST(None, GetAsyncContinuation)
+CONSTANT_OWNERSHIP_INST(Unowned, GetAsyncContinuationAddr)
+CONSTANT_OWNERSHIP_INST(None, ThinToThickFunction)
 #undef CONSTANT_OWNERSHIP_INST
 
 #define CONSTANT_OR_NONE_OWNERSHIP_INST(OWNERSHIP, INST)                       \
@@ -203,9 +207,6 @@ CONSTANT_OR_NONE_OWNERSHIP_INST(Owned, MarkUninitialized)
 // a performance perspective.
 CONSTANT_OR_NONE_OWNERSHIP_INST(Unowned, UncheckedBitwiseCast)
 
-// A thin_to_thick instruction can return a trivial (@noescape) type.
-CONSTANT_OR_NONE_OWNERSHIP_INST(Owned, ThinToThickFunction)
-
 #undef CONSTANT_OR_NONE_OWNERSHIP_INST
 
 // For a forwarding instruction, we loop over all operands and make sure that
@@ -253,6 +254,7 @@ FORWARDING_OWNERSHIP_INST(Tuple)
 FORWARDING_OWNERSHIP_INST(UncheckedRefCast)
 FORWARDING_OWNERSHIP_INST(UnconditionalCheckedCast)
 FORWARDING_OWNERSHIP_INST(Upcast)
+FORWARDING_OWNERSHIP_INST(UncheckedValueCast)
 FORWARDING_OWNERSHIP_INST(UncheckedEnumData)
 FORWARDING_OWNERSHIP_INST(SelectEnum)
 FORWARDING_OWNERSHIP_INST(Enum)
@@ -537,6 +539,7 @@ CONSTANT_OWNERSHIP_BUILTIN(None, TSanInoutAccess)
 CONSTANT_OWNERSHIP_BUILTIN(None, Swift3ImplicitObjCEntrypoint)
 CONSTANT_OWNERSHIP_BUILTIN(None, PoundAssert)
 CONSTANT_OWNERSHIP_BUILTIN(None, TypePtrAuthDiscriminator)
+CONSTANT_OWNERSHIP_BUILTIN(None, IntInstrprofIncrement)
 CONSTANT_OWNERSHIP_BUILTIN(None, GlobalStringTablePointer)
 
 #undef CONSTANT_OWNERSHIP_BUILTIN

@@ -27,9 +27,9 @@
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/GenericSignature.h"
-#include "swift/AST/ParameterList.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ModuleLoader.h"
+#include "swift/AST/ParameterList.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/Basic/ExternalUnion.h"
 #include "swift/Basic/Range.h"
@@ -37,6 +37,7 @@
 #include "swift/Basic/Unicode.h"
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILArgument.h"
+#include "clang/AST/DeclCXX.h"
 #include "llvm/Support/Compiler.h"
 
 using namespace swift;
@@ -74,10 +75,10 @@ getIndirectApplyAbstractionPattern(SILGenFunction &SGF,
   case FunctionTypeRepresentation::Block: {
     // C and block function parameters and results are implicitly
     // bridged to a foreign type.
-    auto bridgedType =
-      SGF.SGM.Types.getBridgedFunctionType(pattern, fnType,
-                                           fnType->getExtInfo(),
-                                           Bridgeability::Full);
+    auto silRep =
+        SILFunctionTypeRepresentation(fnType->getExtInfo().getRepresentation());
+    auto bridgedType = SGF.SGM.Types.getBridgedFunctionType(
+        pattern, fnType, Bridgeability::Full, silRep);
     pattern.rewriteType(CanGenericSignature(), bridgedType);
     return pattern;
   }
@@ -131,8 +132,11 @@ getDynamicMethodLoweredType(SILModule &M,
                             SILDeclRef constant,
                             CanAnyFunctionType substMemberTy) {
   assert(constant.isForeign);
-  auto objcFormalTy = substMemberTy.withExtInfo(substMemberTy->getExtInfo()
-             .withSILRepresentation(SILFunctionTypeRepresentation::ObjCMethod));
+  auto objcFormalTy = substMemberTy.withExtInfo(
+      substMemberTy->getExtInfo()
+          .intoBuilder()
+          .withSILRepresentation(SILFunctionTypeRepresentation::ObjCMethod)
+          .build());
   return SILType::getPrimitiveObjectType(
       M.Types.getUncachedSILFunctionTypeForConstant(
           TypeExpansionContext::minimal(), constant, objcFormalTy));
@@ -315,7 +319,8 @@ private:
   CanFunctionType SubstFormalInterfaceType;
 
   /// The substitutions applied to OrigFormalInterfaceType to produce
-  /// SubstFormalInterfaceType.
+  /// SubstFormalInterfaceType, substituted into the current type expansion
+  /// context.
   SubstitutionMap Substitutions;
 
   /// The list of values captured by our callee.
@@ -351,14 +356,14 @@ private:
   /// Constructor for Callee::forDirect.
   Callee(SILGenFunction &SGF, SILDeclRef standaloneFunction,
          AbstractionPattern origFormalType, CanAnyFunctionType substFormalType,
-         SubstitutionMap subs, SILLocation l,
+         SubstitutionMap subs, SubstitutionMap formalSubs, SILLocation l,
          bool callDynamicallyReplaceableImpl = false)
       : kind(callDynamicallyReplaceableImpl
                  ? Kind::StandaloneFunctionDynamicallyReplaceableImpl
                  : Kind::StandaloneFunction),
         Constant(standaloneFunction), OrigFormalInterfaceType(origFormalType),
         SubstFormalInterfaceType(
-            getSubstFormalInterfaceType(substFormalType, subs)),
+            getSubstFormalInterfaceType(substFormalType, formalSubs)),
         Substitutions(subs), Loc(l) {}
 
   /// Constructor called by all for* factory methods except forDirect and
@@ -387,7 +392,9 @@ public:
     auto &ci = SGF.getConstantInfo(SGF.getTypeExpansionContext(), c);
     return Callee(
         SGF, c, ci.FormalPattern, ci.FormalType,
-        subs.mapIntoTypeExpansionContext(SGF.getTypeExpansionContext()), l,
+        subs.mapIntoTypeExpansionContext(SGF.getTypeExpansionContext()),
+        subs,
+        l,
         callPreviousDynamicReplaceableImpl);
   }
 
@@ -552,6 +559,11 @@ public:
     auto func = cast<AbstractFunctionDecl>(constant->getDecl());
     result.foreignError = func->getForeignErrorConvention();
     result.foreignSelf = func->getImportAsMemberStatus();
+
+    // Remove the metatype "self" parameter by making this a static member.
+    if (constant->getDecl()->getClangDecl() &&
+        isa<clang::CXXConstructorDecl>(constant->getDecl()->getClangDecl()))
+      result.foreignSelf.setStatic();
 
     return result;
   }
@@ -1340,8 +1352,8 @@ public:
           && loweredResultTy.getASTType()->hasDynamicSelfType()) {
         assert(selfMetaTy);
         selfValue = SGF.emitManagedRValueWithCleanup(
-          SGF.B.createUncheckedBitCast(loc, selfValue.forward(SGF),
-                                       loweredResultTy));
+            SGF.B.createUncheckedReinterpretCast(loc, selfValue.forward(SGF),
+                                                 loweredResultTy));
       } else {
         selfValue = SGF.emitManagedRValueWithCleanup(
             SGF.B.createUpcast(loc, selfValue.forward(SGF), loweredResultTy));
@@ -1622,11 +1634,6 @@ static PreparedArguments emitStringLiteral(SILGenFunction &SGF, Expr *E,
     Length = Str.size();
     break;
 
-  case StringLiteralExpr::UTF16: {
-    instEncoding = StringLiteralInst::Encoding::UTF16;
-    Length = unicode::getUTF16Length(Str);
-    break;
-  }
   case StringLiteralExpr::OneUnicodeScalar: {
     SILType Int32Ty = SILType::getBuiltinIntegerType(32, SGF.getASTContext());
     SILValue UnicodeScalarValue =
@@ -1668,11 +1675,6 @@ static PreparedArguments emitStringLiteral(SILGenFunction &SGF, Expr *E,
   ArrayRef<ManagedValue> Elts;
   ArrayRef<AnyFunctionType::Param> TypeElts;
   switch (instEncoding) {
-  case StringLiteralInst::Encoding::UTF16:
-    Elts = llvm::makeArrayRef(EltsArray).slice(0, 2);
-    TypeElts = llvm::makeArrayRef(TypeEltsArray).slice(0, 2);
-    break;
-
   case StringLiteralInst::Encoding::UTF8:
     Elts = EltsArray;
     TypeElts = TypeEltsArray;
@@ -1788,6 +1790,139 @@ static bool hasUnownedInnerPointerResult(CanSILFunctionType fnType) {
       return true;
   }
   return false;
+}
+
+//===----------------------------------------------------------------------===//
+//                  Argument Emission for Builtin Initializer
+//===----------------------------------------------------------------------===//
+static inline PreparedArguments
+buildBuiltinLiteralArgs(SILGenFunction &SGF, SGFContext C,
+                        StringLiteralExpr *stringLiteral) {
+  return emitStringLiteral(SGF, stringLiteral, stringLiteral->getValue(), C,
+                           stringLiteral->getEncoding());
+}
+
+static inline PreparedArguments
+buildBuiltinLiteralArgs(NilLiteralExpr *nilLiteral) {
+  PreparedArguments builtinLiteralArgs;
+  builtinLiteralArgs.emplace({});
+  return builtinLiteralArgs;
+}
+
+static inline PreparedArguments
+buildBuiltinLiteralArgs(SILGenFunction &SGF, SGFContext C,
+                        BooleanLiteralExpr *booleanLiteral) {
+  PreparedArguments builtinLiteralArgs;
+  auto i1Ty = SILType::getBuiltinIntegerType(1, SGF.getASTContext());
+  SILValue boolValue = SGF.B.createIntegerLiteral(booleanLiteral, i1Ty,
+                                                  booleanLiteral->getValue());
+  ManagedValue boolManaged = ManagedValue::forUnmanaged(boolValue);
+  CanType ty = boolManaged.getType().getASTType()->getCanonicalType();
+  builtinLiteralArgs.emplace(AnyFunctionType::Param(ty));
+  builtinLiteralArgs.add(booleanLiteral, RValue(SGF, {boolManaged}, ty));
+  return builtinLiteralArgs;
+}
+
+static inline PreparedArguments
+buildBuiltinLiteralArgs(SILGenFunction &SGF, SGFContext C,
+                        IntegerLiteralExpr *integerLiteral) {
+  PreparedArguments builtinLiteralArgs;
+  ManagedValue integerManaged =
+      ManagedValue::forUnmanaged(SGF.B.createIntegerLiteral(
+          integerLiteral,
+          SILType::getBuiltinIntegerLiteralType(SGF.getASTContext()),
+          integerLiteral->getRawValue()));
+  CanType ty = integerManaged.getType().getASTType();
+  builtinLiteralArgs.emplace(AnyFunctionType::Param(ty));
+  builtinLiteralArgs.add(integerLiteral, RValue(SGF, {integerManaged}, ty));
+  return builtinLiteralArgs;
+}
+
+static inline PreparedArguments
+buildBuiltinLiteralArgs(SILGenFunction &SGF, SGFContext C,
+                        FloatLiteralExpr *floatLiteral) {
+  PreparedArguments builtinLiteralArgs;
+  auto *litTy = floatLiteral->getBuiltinType()->castTo<BuiltinFloatType>();
+  ManagedValue floatManaged =
+      ManagedValue::forUnmanaged(SGF.B.createFloatLiteral(
+          floatLiteral,
+          SILType::getBuiltinFloatType(litTy->getFPKind(), SGF.getASTContext()),
+          floatLiteral->getValue()));
+
+  CanType ty = floatManaged.getType().getASTType();
+  builtinLiteralArgs.emplace(AnyFunctionType::Param(ty));
+  builtinLiteralArgs.add(floatLiteral, RValue(SGF, {floatManaged}, ty));
+  return builtinLiteralArgs;
+}
+
+static inline PreparedArguments
+buildBuiltinLiteralArgs(SILGenFunction &SGF, SGFContext C,
+                        MagicIdentifierLiteralExpr *magicLiteral) {
+  ASTContext &ctx = SGF.getASTContext();
+  SourceLoc loc = magicLiteral->getStartLoc();
+
+  switch (magicLiteral->getKind()) {
+  case MagicIdentifierLiteralExpr::FileIDSpelledAsFile:
+  case MagicIdentifierLiteralExpr::FileID: {
+    std::string value = loc.isValid() ? SGF.getMagicFileIDString(loc) : "";
+    return emitStringLiteral(SGF, magicLiteral, value, C,
+                             magicLiteral->getStringEncoding());
+  }
+
+  case MagicIdentifierLiteralExpr::FilePathSpelledAsFile:
+  case MagicIdentifierLiteralExpr::FilePath: {
+    StringRef value = loc.isValid() ? SGF.getMagicFilePathString(loc) : "";
+    return emitStringLiteral(SGF, magicLiteral, value, C,
+                             magicLiteral->getStringEncoding());
+  }
+
+  case MagicIdentifierLiteralExpr::Function: {
+    StringRef value = loc.isValid() ? SGF.getMagicFunctionString() : "";
+    return emitStringLiteral(SGF, magicLiteral, value, C,
+                             magicLiteral->getStringEncoding());
+  }
+
+  case MagicIdentifierLiteralExpr::Line:
+  case MagicIdentifierLiteralExpr::Column: {
+    SourceLoc Loc = magicLiteral->getStartLoc();
+    unsigned Value = 0;
+    if (Loc.isValid()) {
+      Value = magicLiteral->getKind() == MagicIdentifierLiteralExpr::Line
+                  ? ctx.SourceMgr.getPresumedLineAndColumnForLoc(Loc).first
+                  : ctx.SourceMgr.getPresumedLineAndColumnForLoc(Loc).second;
+    }
+
+    auto silTy = SILType::getBuiltinIntegerLiteralType(ctx);
+    auto ty = silTy.getASTType();
+    SILValue integer = SGF.B.createIntegerLiteral(magicLiteral, silTy, Value);
+    ManagedValue integerManaged = ManagedValue::forUnmanaged(integer);
+    PreparedArguments builtinLiteralArgs;
+    builtinLiteralArgs.emplace(AnyFunctionType::Param(ty));
+    builtinLiteralArgs.add(magicLiteral, RValue(SGF, {integerManaged}, ty));
+    return builtinLiteralArgs;
+  }
+  case MagicIdentifierLiteralExpr::DSOHandle:
+    llvm_unreachable("handled elsewhere");
+  }
+}
+
+static inline PreparedArguments buildBuiltinLiteralArgs(SILGenFunction &SGF,
+                                                        SGFContext C,
+                                                        LiteralExpr *literal) {
+  if (auto stringLiteral = dyn_cast<StringLiteralExpr>(literal)) {
+    return buildBuiltinLiteralArgs(SGF, C, stringLiteral);
+  } else if (auto nilLiteral = dyn_cast<NilLiteralExpr>(literal)) {
+    return buildBuiltinLiteralArgs(nilLiteral);
+  } else if (auto booleanLiteral = dyn_cast<BooleanLiteralExpr>(literal)) {
+    return buildBuiltinLiteralArgs(SGF, C, booleanLiteral);
+  } else if (auto integerLiteral = dyn_cast<IntegerLiteralExpr>(literal)) {
+    return buildBuiltinLiteralArgs(SGF, C, integerLiteral);
+  } else if (auto floatLiteral = dyn_cast<FloatLiteralExpr>(literal)) {
+    return buildBuiltinLiteralArgs(SGF, C, floatLiteral);
+  } else {
+    return buildBuiltinLiteralArgs(
+        SGF, C, cast<MagicIdentifierLiteralExpr>(literal));
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -3857,7 +3992,7 @@ CallEmission::applySpecializedEmitter(SpecializedEmitter &specializedEmitter,
     auto emitter = specializedEmitter.getEarlyEmitter();
 
     assert(uncurriedSites.size() == 1);
-    assert(!formalType->getExtInfo().throws());
+    assert(!formalType->getExtInfo().isThrowing());
     SILLocation uncurriedLoc = uncurriedSites[0].Loc;
 
     // We should be able to enforce that these arguments are
@@ -4610,11 +4745,11 @@ StringRef SILGenFunction::getMagicFilePathString(SourceLoc loc) {
   return getSourceManager().getDisplayNameForLoc(loc);
 }
 
-std::string SILGenFunction::getMagicFileString(SourceLoc loc) {
+std::string SILGenFunction::getMagicFileIDString(SourceLoc loc) {
   auto path = getMagicFilePathString(loc);
 
-  auto result = SGM.MagicFileStringsByFilePath.find(path);
-  if (result != SGM.MagicFileStringsByFilePath.end())
+  auto result = SGM.FileIDsByFilePath.find(path);
+  if (result != SGM.FileIDsByFilePath.end())
     return std::get<0>(result->second);
 
   return path.str();
@@ -4798,122 +4933,30 @@ RValue SILGenFunction::emitApplyOfPropertyWrapperBackingInitializer(
 RValue SILGenFunction::emitLiteral(LiteralExpr *literal, SGFContext C) {
   ConcreteDeclRef builtinInit;
   ConcreteDeclRef init;
-  // Emit the raw, builtin literal arguments.
-  PreparedArguments builtinLiteralArgs;
-  if (auto stringLiteral = dyn_cast<StringLiteralExpr>(literal)) {
-    builtinLiteralArgs = emitStringLiteral(*this, literal,
-                                           stringLiteral->getValue(), C,
-                                           stringLiteral->getEncoding());
-    builtinInit = stringLiteral->getBuiltinInitializer();
-    init = stringLiteral->getInitializer();
-  } else if (auto nilLiteral = dyn_cast<NilLiteralExpr>(literal)) {
-    builtinLiteralArgs.emplace({});
-    builtinInit = nilLiteral->getInitializer();
-  } else if (auto booleanLiteral = dyn_cast<BooleanLiteralExpr>(literal)) {
-    auto i1Ty = SILType::getBuiltinIntegerType(1, getASTContext());
-    SILValue boolValue = B.createIntegerLiteral(booleanLiteral, i1Ty,
-                                                booleanLiteral->getValue());
-    ManagedValue boolManaged = ManagedValue::forUnmanaged(boolValue);
-    CanType ty = boolManaged.getType().getASTType()->getCanonicalType();
-    builtinLiteralArgs.emplace(AnyFunctionType::Param(ty));
-    builtinLiteralArgs.add(literal, RValue(*this, {boolManaged}, ty));
-    builtinInit = booleanLiteral->getBuiltinInitializer();
-    init = booleanLiteral->getInitializer();
-  } else if (auto integerLiteral = dyn_cast<IntegerLiteralExpr>(literal)) {
-    ManagedValue integerManaged =
-        ManagedValue::forUnmanaged(B.createIntegerLiteral(
-            integerLiteral,
-            SILType::getBuiltinIntegerLiteralType(getASTContext()),
-            integerLiteral->getRawValue()));
-    CanType ty = integerManaged.getType().getASTType();
-    builtinLiteralArgs.emplace(AnyFunctionType::Param(ty));
-    builtinLiteralArgs.add(literal, RValue(*this, {integerManaged}, ty));
-    builtinInit = integerLiteral->getBuiltinInitializer();
-    init = integerLiteral->getInitializer();
-  } else if (auto floatLiteral = dyn_cast<FloatLiteralExpr>(literal)) {
-    auto *litTy = floatLiteral->getBuiltinType()->castTo<BuiltinFloatType>();
-    ManagedValue floatManaged = ManagedValue::forUnmanaged(B.createFloatLiteral(
-        floatLiteral,
-        SILType::getBuiltinFloatType(litTy->getFPKind(), getASTContext()),
-        floatLiteral->getValue()));
-
-    CanType ty = floatManaged.getType().getASTType();
-    builtinLiteralArgs.emplace(AnyFunctionType::Param(ty));
-    builtinLiteralArgs.add(literal, RValue(*this, {floatManaged}, ty));
-    builtinInit = floatLiteral->getBuiltinInitializer();
-    init = floatLiteral->getInitializer();
+  if (auto builtinLiteral = dyn_cast<BuiltinLiteralExpr>(literal)) {
+    builtinInit = builtinLiteral->getBuiltinInitializer();
+    init = builtinLiteral->getInitializer();
   } else {
-    ASTContext &ctx = getASTContext();
-    SourceLoc loc = literal->getStartLoc();
-
-    auto magicLiteral = cast<MagicIdentifierLiteralExpr>(literal);
-    switch (magicLiteral->getKind()) {
-    case MagicIdentifierLiteralExpr::File: {
-      std::string value = loc.isValid() ? getMagicFileString(loc) : "";
-      builtinLiteralArgs = emitStringLiteral(*this, literal, value, C,
-                                             magicLiteral->getStringEncoding());
-      builtinInit = magicLiteral->getBuiltinInitializer();
-      init = magicLiteral->getInitializer();
-      break;
-    }
-
-    case MagicIdentifierLiteralExpr::FilePath: {
-      StringRef value = loc.isValid() ? getMagicFilePathString(loc) : "";
-      builtinLiteralArgs = emitStringLiteral(*this, literal, value, C,
-                                             magicLiteral->getStringEncoding());
-      builtinInit = magicLiteral->getBuiltinInitializer();
-      init = magicLiteral->getInitializer();
-      break;
-    }
-
-    case MagicIdentifierLiteralExpr::Function: {
-      StringRef value = loc.isValid() ? getMagicFunctionString() : "";
-      builtinLiteralArgs = emitStringLiteral(*this, literal, value, C,
-                                             magicLiteral->getStringEncoding());
-      builtinInit = magicLiteral->getBuiltinInitializer();
-      init = magicLiteral->getInitializer();
-      break;
-    }
-
-    case MagicIdentifierLiteralExpr::Line:
-    case MagicIdentifierLiteralExpr::Column: {
-      SourceLoc Loc = literal->getStartLoc();
-      unsigned Value = 0;
-      if (Loc.isValid()) {
-        Value = magicLiteral->getKind() == MagicIdentifierLiteralExpr::Line
-                    ? ctx.SourceMgr.getPresumedLineAndColumnForLoc(Loc).first
-                    : ctx.SourceMgr.getPresumedLineAndColumnForLoc(Loc).second;
-      }
-
-      auto silTy = SILType::getBuiltinIntegerLiteralType(ctx);
-      auto ty = silTy.getASTType();
-      SILValue integer = B.createIntegerLiteral(literal, silTy, Value);
-      ManagedValue integerManaged = ManagedValue::forUnmanaged(integer);
-      builtinLiteralArgs.emplace(AnyFunctionType::Param(ty));
-      builtinLiteralArgs.add(literal, RValue(*this, {integerManaged}, ty));
-      builtinInit = magicLiteral->getBuiltinInitializer();
-      init = magicLiteral->getInitializer();
-      break;
-    }
-    case MagicIdentifierLiteralExpr::DSOHandle:
-      llvm_unreachable("handled elsewhere");
-    }
+    builtinInit = literal->getInitializer();
   }
 
+  // Emit the raw, builtin literal arguments.
+  PreparedArguments builtinLiteralArgs =
+      buildBuiltinLiteralArgs(*this, C, literal);
+
   // Call the builtin initializer.
-  RValue builtinLiteral =
-    emitApplyAllocatingInitializer(literal, builtinInit,
-                                   std::move(builtinLiteralArgs),
-                                   Type(),
-                                   init ? SGFContext() : C);
+  RValue builtinResult = emitApplyAllocatingInitializer(
+      literal, builtinInit, std::move(builtinLiteralArgs), Type(),
+      init ? SGFContext() : C);
 
   // If we were able to directly initialize the literal we wanted, we're done.
-  if (!init) return builtinLiteral;
+  if (!init)
+    return builtinResult;
 
   // Otherwise, perform the second initialization step.
-  auto ty = builtinLiteral.getType();
+  auto ty = builtinResult.getType();
   PreparedArguments args((AnyFunctionType::Param(ty)));
-  args.add(literal, std::move(builtinLiteral));
+  args.add(literal, std::move(builtinResult));
 
   RValue result = emitApplyAllocatingInitializer(literal, init,
                                                  std::move(args),
@@ -5436,7 +5479,7 @@ RValue SILGenFunction::emitGetAccessor(SILLocation loc, SILDeclRef get,
     subscriptIndices.emplace({});
 
   emission.addCallSite(loc, std::move(subscriptIndices),
-                       accessType->throws());
+                       accessType->isThrowing());
 
   // T
   return emission.apply(c);
@@ -5478,8 +5521,7 @@ void SILGenFunction::emitSetAccessor(SILLocation loc, SILDeclRef set,
     }
   }
   assert(values.isValid());
-  emission.addCallSite(loc, std::move(values),
-                       accessType->throws());
+  emission.addCallSite(loc, std::move(values), accessType->isThrowing());
   // ()
   emission.apply();
 }
@@ -5513,7 +5555,7 @@ ManagedValue SILGenFunction::emitAddressorAccessor(
     subscriptIndices.emplace({});
 
   emission.addCallSite(loc, std::move(subscriptIndices),
-                       accessType->throws());
+                       accessType->isThrowing());
 
   // Unsafe{Mutable}Pointer<T> or
   // (Unsafe{Mutable}Pointer<T>, Builtin.UnknownPointer) or
@@ -5575,7 +5617,7 @@ SILGenFunction::emitCoroutineAccessor(SILLocation loc, SILDeclRef accessor,
     subscriptIndices.emplace({});
 
   emission.addCallSite(loc, std::move(subscriptIndices),
-                       accessType->throws());
+                       accessType->isThrowing());
 
   auto endApplyHandle = emission.applyCoroutine(yields);
 

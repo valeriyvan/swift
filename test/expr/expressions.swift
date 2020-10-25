@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -disable-parser-lookup
 
 //===----------------------------------------------------------------------===//
 // Tests and samples.
@@ -246,15 +246,16 @@ func test_as_2() {
 func test_lambda() {
   // A simple closure.
   var a = { (value: Int) -> () in markUsed(value+1) }
+  // expected-warning@-1 {{initialization of variable 'a' was never used; consider replacing with assignment to '_' or removing it}}
 
   // A recursive lambda.
-  // FIXME: This should definitely be accepted.
   var fib = { (n: Int) -> Int in
+    // expected-warning@-1 {{variable 'fib' was never mutated; consider changing to 'let' constant}}
     if (n < 2) {
       return n
     }
     
-    return fib(n-1)+fib(n-2) // expected-error 2 {{variable used within its own initial value}}
+    return fib(n-1)+fib(n-2)
   }
 }
 
@@ -790,7 +791,7 @@ func testNilCoalescePrecedence(cond: Bool, a: Int?, r: ClosedRange<Int>?) {
 
   // ?? should have lower precedence than range and arithmetic operators.
   let r1 = r ?? (0...42) // ok
-  let r2 = (r ?? 0)...42 // not ok: expected-error 2 {{cannot convert value of type 'Int' to expected argument type 'ClosedRange<Int>'}}
+  let r2 = (r ?? 0)...42 // not ok: expected-error {{binary operator '??' cannot be applied to operands of type 'ClosedRange<Int>?' and 'Int'}}
   let r3 = r ?? 0...42 // parses as the first one, not the second.
   
   

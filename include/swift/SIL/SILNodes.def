@@ -458,6 +458,8 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
                       LiteralInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(GlobalAddrInst, global_addr,
                       LiteralInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST(BaseAddrForOffsetInst, base_addr_for_offset,
+                      LiteralInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(GlobalValueInst, global_value,
                       LiteralInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(IntegerLiteralInst, integer_literal,
@@ -497,6 +499,8 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
     SINGLE_VALUE_INST(UncheckedTrivialBitCastInst, unchecked_trivial_bit_cast,
                       ConversionInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(UncheckedBitwiseCastInst, unchecked_bitwise_cast,
+                      ConversionInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST(UncheckedValueCastInst, unchecked_value_cast,
                       ConversionInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(RefToRawPointerInst, ref_to_raw_pointer,
                       ConversionInst, None, DoesNotRelease)
@@ -709,6 +713,18 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   SINGLE_VALUE_INST(DifferentiabilityWitnessFunctionInst,
                     differentiability_witness_function,
                     SingleValueInstruction, None, DoesNotRelease)
+  
+  // Async
+  // TODO: The side effects declarations on this instruction could likely
+  // be tightened, though we want to be careful that passes that try to do
+  // code motion or eliminate this instruction don't do so without awareness of
+  // its structural requirements.
+  ABSTRACT_SINGLE_VALUE_INST(GetAsyncContinuationInstBase, SingleValueInstruction)
+    SINGLE_VALUE_INST(GetAsyncContinuationInst, get_async_continuation,
+                      GetAsyncContinuationInstBase, MayHaveSideEffects, MayRelease)
+    SINGLE_VALUE_INST(GetAsyncContinuationAddrInst, get_async_continuation_addr,
+                      GetAsyncContinuationInstBase, MayHaveSideEffects, MayRelease)
+    SINGLE_VALUE_INST_RANGE(GetAsyncContinuationInstBase, GetAsyncContinuationInst, GetAsyncContinuationAddrInst)
 
   // Key paths
   // TODO: The only "side effect" is potentially retaining the returned key path
@@ -746,6 +762,8 @@ ABSTRACT_INST(TermInst, SILInstruction)
              TermInst, MayRead, DoesNotRelease)
   TERMINATOR(DynamicMethodBranchInst, dynamic_method_br,
              TermInst, None, DoesNotRelease)
+  TERMINATOR(AwaitAsyncContinuationInst, await_async_continuation,
+             TermInst, MayHaveSideEffects, MayRelease)
   DYNAMICCAST_TERMINATOR(CheckedCastBranchInst, checked_cast_br,
              TermInst, None, DoesNotRelease)
   DYNAMICCAST_TERMINATOR(CheckedCastAddrBranchInst, checked_cast_addr_br,

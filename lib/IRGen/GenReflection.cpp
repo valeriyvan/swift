@@ -780,8 +780,8 @@ private:
     auto *PD = dyn_cast<ProtocolDecl>(NTD);
     if (CD && CD->getSuperclass()) {
       addTypeRef(CD->getSuperclass(), CD->getGenericSignature());
-    } else if (PD && PD->getDeclaredType()->getSuperclass()) {
-      addTypeRef(PD->getDeclaredType()->getSuperclass(),
+    } else if (PD && PD->getDeclaredInterfaceType()->getSuperclass()) {
+      addTypeRef(PD->getDeclaredInterfaceType()->getSuperclass(),
                  PD->getGenericSignature());
     } else {
       B.addInt32(0);
@@ -1025,8 +1025,8 @@ public:
         return true;
     }
 
-    auto ElementTypes = Layout.getElementTypes().slice(
-        Layout.hasBindings() ? 1 : 0);
+    auto ElementTypes =
+        Layout.getElementTypes().slice(Layout.getIndexAfterBindings());
     for (auto ElementType : ElementTypes) {
       auto SwiftType = ElementType.getASTType();
       if (SwiftType->hasOpenedExistential())
@@ -1040,7 +1040,7 @@ public:
   /// We'll keep track of how many things are in the bindings struct with its
   /// own count in the capture descriptor.
   ArrayRef<SILType> getElementTypes() {
-    return Layout.getElementTypes().slice(Layout.hasBindings() ? 1 : 0);
+    return Layout.getElementTypes().slice(Layout.getIndexAfterBindings());
   }
 
   /// Build a map from generic parameter -> source of its metadata at runtime.
