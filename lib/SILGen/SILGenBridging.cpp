@@ -2164,6 +2164,7 @@ void SILGenFunction::emitForeignToNativeThunk(SILDeclRef thunk) {
         ManagedValue param;
         switch (thunkParam.getConvention()) {
         case ParameterConvention::Direct_Owned:
+        case ParameterConvention::Indirect_In:
           param = emitManagedRValueWithCleanup(paramValue);
           break;
         case ParameterConvention::Direct_Guaranteed:
@@ -2173,9 +2174,6 @@ void SILGenFunction::emitForeignToNativeThunk(SILDeclRef thunk) {
         case ParameterConvention::Indirect_Inout:
         case ParameterConvention::Indirect_InoutAliasable:
           param = ManagedValue::forLValue(paramValue);
-          break;
-        case ParameterConvention::Indirect_In:
-          param = emitManagedRValueWithCleanup(paramValue);
           break;
         case ParameterConvention::Indirect_In_Guaranteed: {
           auto tmp = emitTemporaryAllocation(fd, paramValue->getType());
